@@ -89,7 +89,7 @@ const AdminsPage = {
         return;
       }
 
-      if (!nextSync) {
+      if (!nextSync || nextSync <= 0) {
         el.textContent = '--:--';
         container.style.color = 'var(--text-muted)';
         container.querySelector('i').className = 'fas fa-clock';
@@ -97,6 +97,13 @@ const AdminsPage = {
       }
 
       const remaining = Math.max(0, nextSync - Date.now());
+      if (remaining <= 0) {
+        // Sync should be starting any moment
+        el.textContent = 'Sắp sync...';
+        container.style.color = 'var(--success)';
+        container.querySelector('i').className = 'fas fa-sync-alt fa-spin';
+        return;
+      }
       const mins = Math.floor(remaining / 60000);
       const secs = Math.floor((remaining % 60000) / 1000);
       el.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
@@ -110,8 +117,13 @@ const AdminsPage = {
         const data = await App.api('/api/admins/next-sync');
         if (data.status === 'syncing') {
           nextSync = 'syncing';
-        } else {
+        } else if (data.nextSync && data.nextSync > Date.now()) {
           nextSync = data.nextSync;
+        } else if (data.nextSync && data.nextSync > 0) {
+          // nextSync is in the past — sync is about to start
+          nextSync = 'syncing';
+        } else {
+          nextSync = null;
         }
       } catch { }
     };
