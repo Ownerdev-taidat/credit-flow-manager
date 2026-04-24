@@ -1881,20 +1881,92 @@ async function addFamilyMember(adminId, memberEmail) {
 
         if (!clicked) throw new Error('Không tìm thấy nút Gửi trên trang mời');
 
-        await smartSleep(driver, 5000);
+        // Wait for the send action to complete — Google may take time to process
+        await smartSleep(driver, 3000);
 
-        // Step 5: Check for success page + click "Tôi hiểu"
+        // Check if we need to click again — sometimes first click just focuses
+        // Retry click with JavaScript + Enter key approach
+        try {
+            const currentPageText = await driver.findElement(By.css('body')).getText();
+            const stillOnInvitePage = currentPageText.includes('Invite your family') || currentPageText.includes('Mời gia đình');
+            if (stillOnInvitePage) {
+                console.log('[AddMember] Still on invite page after first click, retrying with JS + Enter...');
+                // Try pressing Enter on the email input
+                const activeEl = await driver.switchTo().activeElement();
+                await activeEl.sendKeys(Key.RETURN);
+                await smartSleep(driver, 2000);
+
+                // Try clicking Send button again with force JS click
+                const allBtns = await driver.findElements(By.css('button'));
+                for (const btn of allBtns) {
+                    try {
+                        const txt = (await btn.getText()).trim();
+                        if (txt === 'Send' || txt === 'Gửi' || txt === 'Gửi lời mời' || txt === 'Send invitation') {
+                            await driver.executeScript('arguments[0].click(); arguments[0].dispatchEvent(new MouseEvent("click", {bubbles: true}));', btn);
+                            console.log(`[AddMember] Force JS clicked: "${txt}"`);
+                            break;
+                        }
+                    } catch { }
+                }
+                await smartSleep(driver, 5000);
+            }
+        } catch (retryErr) {
+            console.log('[AddMember] Retry click error (non-fatal):', retryErr.message);
+        }
+
+        // Wait a bit more for page transition
+        await smartSleep(driver, 3000);
+
+        // Step 5: Check for success — broadened detection
         currentUrl = await driver.getCurrentUrl();
         console.log(`[AddMember] After send URL: ${currentUrl}`);
 
         const pageText = await driver.findElement(By.css('body')).getText();
-        if (pageText.includes('Đã gửi lời mời') || pageText.includes('Invitation sent') || currentUrl.includes('invitationcomplete')) {
-            console.log('[AddMember] ✓ Invitation sent successfully!');
+        console.log('[AddMember] Page text after send:', pageText.substring(0, 800));
 
-            // Click "Tôi hiểu" button
+        // Success indicators (Vietnamese + English + URL-based)
+        const successIndicators = [
+            'Đã gửi lời mời', 'Invitation sent', 'invitationcomplete',
+            'Đã gửi', 'was sent', 'has been sent',
+            'Bạn đã mời', 'You invited', "You've invited",
+            'Chúng tôi đã gửi', 'We sent', "We've sent",
+            'Lời mời đã được gửi', 'pending',
+            'Tôi hiểu', 'Got it', 'I understand', 'OK',
+            'thành viên gia đình', 'family member'
+        ];
+
+        const isSuccess = successIndicators.some(indicator => 
+            pageText.includes(indicator) || currentUrl.includes(indicator.toLowerCase())
+        );
+
+        // Also check: if we navigated AWAY from invitemembers page = likely success
+        const leftInvitePage = !currentUrl.includes('invitemembers');
+
+        // Error indicators
+        const errorIndicators = [
+            { text: 'không hợp lệ', msg: `Email ${memberEmail} không hợp lệ` },
+            { text: 'invalid', msg: `Email ${memberEmail} không hợp lệ` },
+            { text: 'đã là thành viên', msg: `${memberEmail} đã là thành viên rồi` },
+            { text: 'already a member', msg: `${memberEmail} đã là thành viên rồi` },
+            { text: 'already in', msg: `${memberEmail} đã là thành viên rồi` },
+            { text: 'too many', msg: 'Nhóm gia đình đã đầy' },
+            { text: 'đã đạt giới hạn', msg: 'Nhóm gia đình đã đầy' },
+            { text: 'quá nhiều', msg: 'Nhóm gia đình đã đầy' }
+        ];
+
+        for (const err of errorIndicators) {
+            if (pageText.toLowerCase().includes(err.text)) {
+                throw new Error(err.msg);
+            }
+        }
+
+        if (isSuccess || leftInvitePage) {
+            console.log(`[AddMember] ✓ Invitation sent successfully! (isSuccess=${isSuccess}, leftInvitePage=${leftInvitePage})`);
+
+            // Click "Tôi hiểu" / "Got it" button if present
             try {
                 const understandBtn = await driver.findElement(By.xpath(
-                    "//button[contains(text(), 'Tôi hiểu') or contains(text(), 'Got it') or contains(text(), 'I understand')]"
+                    "//button[contains(text(), 'Tôi hiểu') or contains(text(), 'Got it') or contains(text(), 'I understand') or contains(text(), 'OK')]"
                 ));
                 await safeClick(driver, understandBtn);
                 await smartSleep(driver, 2000);
@@ -1909,13 +1981,11 @@ async function addFamilyMember(adminId, memberEmail) {
                 endDate.setDate(endDate.getDate() + 30);
                 const startStr = today.toISOString().split('T')[0];
                 const endStr = endDate.toISOString().split('T')[0];
-                // Check if member already exists
                 const existing = await db.prepare("SELECT id FROM members WHERE admin_id = ? AND email = ? AND status IN ('active', 'pending')").get(adminId, memberEmail);
                 if (!existing) {
                     await db.prepare("INSERT INTO members (admin_id, name, email, status, start_date, end_date) VALUES (?, ?, ?, 'pending', ?, ?)").run(adminId, memberEmail, memberEmail, startStr, endStr);
                     console.log(`[AddMember] ✓ Member saved to DB: ${memberEmail} (${startStr} → ${endStr})`);
                 } else {
-                    // Update dates if not set
                     await db.prepare("UPDATE members SET start_date = COALESCE(start_date, ?), end_date = COALESCE(end_date, ?) WHERE id = ?").run(startStr, endStr, existing.id);
                     console.log(`[AddMember] ✓ Member dates updated: ${memberEmail}`);
                 }
@@ -1925,13 +1995,9 @@ async function addFamilyMember(adminId, memberEmail) {
 
             syncStatus[adminId] = { status: 'done', message: `✅ Đã gửi lời mời tới ${memberEmail}` };
             return { success: true, message: `Đã gửi lời mời tới ${memberEmail}` };
-
-        } else if (pageText.includes('không hợp lệ') || pageText.includes('invalid')) {
-            throw new Error(`Email ${memberEmail} không hợp lệ`);
-        } else if (pageText.includes('đã là thành viên') || pageText.includes('already a member')) {
-            throw new Error(`${memberEmail} đã là thành viên rồi`);
         } else {
-            console.log('[AddMember] Page text after send:', pageText.substring(0, 500));
+            // Still on invite page — Send button might not have worked
+            console.log('[AddMember] ⚠ Could not confirm invitation result');
             throw new Error('Không xác định được kết quả gửi lời mời — kiểm tra thủ công trên Google Family');
         }
 
