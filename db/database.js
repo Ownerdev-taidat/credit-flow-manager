@@ -427,19 +427,21 @@ async function seedData() {
     }
 
     // Try 2: Read from environment variables (Railway)
-    if (mbConfigs.length === 0 && process.env.MB_API_KEY) {
+    // Supports both naming conventions: apicanhanKey OR MB_API_KEY
+    const envKey = process.env.apicanhanKey || process.env.MB_API_KEY;
+    if (mbConfigs.length === 0 && envKey) {
       mbConfigs = [
-        { key: 'mb_api_key', value: process.env.MB_API_KEY || '' },
-        { key: 'mb_account_no', value: process.env.MB_ACCOUNT_NO || '' },
-        { key: 'mb_user', value: process.env.MB_USER || '' },
-        { key: 'mb_password', value: process.env.MB_PASSWORD || '' },
-        { key: 'mb_bot_token', value: process.env.MB_BOT_TOKEN || '' },
-        { key: 'mb_chat_id', value: process.env.MB_CHAT_ID || '' },
-        { key: 'mb_session_id', value: process.env.MB_SESSION_ID || '' },
-        { key: 'mb_token', value: process.env.MB_TOKEN || '' },
-        { key: 'mb_cookie', value: process.env.MB_COOKIE || '' },
-        { key: 'mb_device_id', value: process.env.MB_DEVICE_ID || '' },
-        { key: 'mb_id_run', value: process.env.MB_ID_RUN || '' },
+        { key: 'mb_api_key', value: envKey },
+        { key: 'mb_account_no', value: process.env.apicanhanAccount || process.env.accountNo || process.env.MB_ACCOUNT_NO || '' },
+        { key: 'mb_user', value: process.env.apicanhanUser || process.env.user || process.env.MB_USER || '' },
+        { key: 'mb_password', value: process.env.apicanhanPass || process.env.MB_PASSWORD || '' },
+        { key: 'mb_bot_token', value: process.env.botToken || process.env.MB_BOT_TOKEN || '' },
+        { key: 'mb_chat_id', value: process.env.chat_id || process.env.MB_CHAT_ID || '' },
+        { key: 'mb_session_id', value: process.env.sessionId || process.env.MB_SESSION_ID || '' },
+        { key: 'mb_token', value: process.env.token || process.env.MB_TOKEN || '' },
+        { key: 'mb_cookie', value: process.env.cookie || process.env.MB_COOKIE || '' },
+        { key: 'mb_device_id', value: process.env.deviceid || process.env.MB_DEVICE_ID || '' },
+        { key: 'mb_id_run', value: process.env.id_run || process.env.MB_ID_RUN || '' },
       ].filter(c => c.value);
       if (mbConfigs.length > 0) console.log('[DB] Found MBBank config in environment variables');
     }
