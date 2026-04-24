@@ -1,0 +1,2504 @@
+/* ========================================
+   Google One Scraper - Selenium + Chrome
+   Auto-login pattern from MY_BOT GoogleLoginAutomation
+   ======================================== */
+
+const { Builder, By, until, Key } = require('selenium-webdriver');
+const chrome = require('selenium-webdriver/chrome');
+require('chromedriver');
+const OTPAuth = require('otpauth');
+const path = require('path');
+const fs = require('fs');
+const { execSync } = require('child_process');
+const db = require('../db/database');
+const { decrypt } = require('./crypto');
+
+// Google One URLs
+const CREDIT_URL = 'https://one.google.com/ai/activity?pli=1&g1_landing_page=0';
+const STORAGE_URL = 'https://one.google.com/storage?hl=vi&utm_source=google-account&utm_medium=web&g1_landing_page=2';
+
+// Persistent Chrome profiles (local disk for speed)
+const BROWSER_DATA_DIR = path.join(__dirname, '..', 'browser_data');
+
+// ========= AUTO CLEANUP — remove heavy cache data, keep cookies/session =========
+const CLEANUP_DIRS = [
+    'Cache', 'Code Cache', 'GPUCache', 'Service Worker',
+    'blob_storage', 'File System', 'IndexedDB', 'databases',
+    'GCM Store', 'BudgetDatabase', 'coupon_db', 'Download Service',
+    'Feature Engagement Tracker', 'optimization_guide_model_metadata',
+    'optimization_guide_prediction_model_downloads', 'Safe Browsing',
+    'Segmentation Platform', 'shared_proto_db', 'Site Characteristics Database',
+    'Crash Reports', 'DawnCache', 'DawnGraphiteCache', 'GraphiteDawnCache',
+    'commerce_subscription_db', 'component_crx_cache', 'CertificateRevocation',
+    'Local Storage', 'Session Storage', 'Sessions', 'ShaderCache',
+    'WebStorage', 'Storage', 'media_cache', 'MediaCache',
+    'PepperFlash', 'Thumbnails', 'JumpListIcons', 'JumpListIconsOld',
+    'AutofillStrikeDatabase', 'BrowserMetrics', 'ClientSidePhishing',
+    'data_reduction_proxy_leveldb', 'Extension Rules', 'Extension Scripts',
+    'Extension State', 'Extensions', 'GrShaderCache',
+    'InterventionPolicyDatabase', 'Platform Notifications',
+    'Policy', 'Search Logos', 'Sync Data', 'Sync Data Backup',
+    'VideoDecodeStats', 'WebrtcVideoStats', 'ZxcvbnData',
+    'Subresource Filter', 'PersistentOriginTrials',
+];
+// Files to delete (heavy but not needed for login)
+const CLEANUP_FILES = [
+    'Visited Links', 'History', 'History-journal', 'Favicons', 'Favicons-journal',
+    'Top Sites', 'Top Sites-journal', 'Network Action Predictor', 'QuotaManager',
+    'QuotaManager-journal', 'heavy_ad_intervention_opt_out.db',
+    'Shortcuts', 'Shortcuts-journal', 'TransportSecurity',
+    'LOG', 'LOG.old', 'LOCK',
+    'Reporting and NEL', 'Reporting and NEL-journal',
+    'Network Persistent State', 'previews_opt_out.db',
+    'previews_opt_out.db-journal', 'WebRtcVideoStats',
+    'chrome_cart_db', 'chrome_cart_db-journal',
+    'Affiliation Database', 'Affiliation Database-journal',
+];
+
+function cleanBrowserProfile(email) {
+    const safeEmail = (email || '').replace(/[^a-zA-Z0-9]/g, '_');
+    const profileDir = path.join(BROWSER_DATA_DIR, `profile_${safeEmail}`);
+    const defaultDir = path.join(profileDir, 'Default');
+    if (!fs.existsSync(profileDir)) return;
+
+    let freedBytes = 0;
+
+    const getDirSize = (dir) => {
+        let size = 0;
+        try {
+            const items = fs.readdirSync(dir, { withFileTypes: true });
+            for (const item of items) {
+                const fp = path.join(dir, item.name);
+                if (item.isDirectory()) size += getDirSize(fp);
+                else try { size += fs.statSync(fp).size; } catch { }
+            }
+        } catch { }
+        return size;
+    };
+
+    // Clean from both profile root and Default subfolder
+    for (const baseDir of [profileDir, defaultDir]) {
+        if (!fs.existsSync(baseDir)) continue;
+        for (const name of CLEANUP_DIRS) {
+            const target = path.join(baseDir, name);
+            if (fs.existsSync(target)) {
+                const size = getDirSize(target);
+                try { fs.rmSync(target, { recursive: true, force: true }); freedBytes += size; } catch { }
+            }
+        }
+        for (const name of CLEANUP_FILES) {
+            const target = path.join(baseDir, name);
+            if (fs.existsSync(target)) {
+                try { const s = fs.statSync(target).size; fs.unlinkSync(target); freedBytes += s; } catch { }
+            }
+        }
+    }
+
+    if (freedBytes > 0) {
+        const mb = (freedBytes / 1024 / 1024).toFixed(1);
+        console.log(`[Cleanup] ${safeEmail}: freed ${mb} MB`);
+    }
+}
+
+// ========= DEEP CLEAN — whitelist approach: keep ONLY login-essential files =========
+const KEEP_FILES = new Set([
+    'Cookies', 'Cookies-journal',
+    'Login Data', 'Login Data-journal', 'Login Data For Account',
+    'Web Data', 'Web Data-journal',
+    'Preferences', 'Secure Preferences', 'Local State',
+    'Google Profile', 'Google Profile Picture.png',
+]);
+const KEEP_DIRS = new Set(['Network']); // Network chứa Cookies trong Chrome mới
+
+function getDirSizeUtil(dir) {
+    let size = 0;
+    try {
+        const items = fs.readdirSync(dir, { withFileTypes: true });
+        for (const item of items) {
+            const fp = path.join(dir, item.name);
+            if (item.isDirectory()) size += getDirSizeUtil(fp);
+            else try { size += fs.statSync(fp).size; } catch { }
+        }
+    } catch { }
+    return size;
+}
+
+/** Clean inside a kept directory (e.g. Network/) — keep only Cookies files */
+function cleanInsideDir(dirPath) {
+    let freed = 0;
+    try {
+        const items = fs.readdirSync(dirPath, { withFileTypes: true });
+        for (const item of items) {
+            const fullPath = path.join(dirPath, item.name);
+            if (KEEP_FILES.has(item.name)) continue; // keep essential files
+            if (item.isDirectory()) {
+                const s = getDirSizeUtil(fullPath);
+                try { fs.rmSync(fullPath, { recursive: true, force: true }); freed += s; } catch { }
+            } else {
+                try { freed += fs.statSync(fullPath).size; fs.unlinkSync(fullPath); } catch { }
+            }
+        }
+    } catch { }
+    return freed;
+}
+
+/** Deep clean a single profile directory — whitelist approach */
+function deepCleanSingleProfile(profilePath) {
+    let freed = 0;
+    for (const baseDir of [profilePath, path.join(profilePath, 'Default')]) {
+        if (!fs.existsSync(baseDir)) continue;
+        try {
+            const items = fs.readdirSync(baseDir, { withFileTypes: true });
+            for (const item of items) {
+                const fullPath = path.join(baseDir, item.name);
+                if (item.isDirectory()) {
+                    if (item.name === 'Default' && baseDir === profilePath) continue; // will clean inside
+                    if (KEEP_DIRS.has(item.name)) {
+                        freed += cleanInsideDir(fullPath); // clean inside, keep dir
+                    } else {
+                        const s = getDirSizeUtil(fullPath);
+                        try { fs.rmSync(fullPath, { recursive: true, force: true }); freed += s; } catch { }
+                    }
+                } else {
+                    if (!KEEP_FILES.has(item.name)) {
+                        try { freed += fs.statSync(fullPath).size; fs.unlinkSync(fullPath); } catch { }
+                    }
+                }
+            }
+        } catch { }
+    }
+    return freed;
+}
+
+/** Deep clean ALL profiles in browser_data/ — call after sync cycle */
+function deepCleanAllProfiles() {
+    if (!fs.existsSync(BROWSER_DATA_DIR)) return;
+    console.log('[DeepClean] 🧹 Starting deep clean of all browser profiles...');
+    let totalFreed = 0;
+    try {
+        const profiles = fs.readdirSync(BROWSER_DATA_DIR, { withFileTypes: true });
+        for (const profile of profiles) {
+            if (!profile.isDirectory()) continue;
+            const profilePath = path.join(BROWSER_DATA_DIR, profile.name);
+            const freed = deepCleanSingleProfile(profilePath);
+            if (freed > 0) {
+                console.log(`[DeepClean] ${profile.name}: freed ${(freed / 1024 / 1024).toFixed(1)} MB`);
+            }
+            totalFreed += freed;
+        }
+    } catch (e) {
+        console.error('[DeepClean] Error:', e.message);
+    }
+    if (totalFreed > 0) {
+        console.log(`[DeepClean] ✅ Total freed: ${(totalFreed / 1024 / 1024).toFixed(1)} MB`);
+    } else {
+        console.log('[DeepClean] ✅ Already clean, nothing to free');
+    }
+}
+
+// Track active sync status
+const syncStatus = {};
+
+function getSyncStatus(adminId) {
+    return syncStatus[adminId] || { status: 'idle', message: '', last_sync: null };
+}
+
+// ========= ERROR CLASSIFICATION =========
+// Convert raw Selenium/Chrome errors into human-readable Vietnamese messages
+function classifyScraperError(rawMessage) {
+    if (!rawMessage) return 'Lỗi không xác định';
+    const msg = rawMessage.toLowerCase();
+
+    // Already a friendly Vietnamese message — return as-is
+    if (rawMessage.startsWith('⚠') || rawMessage.startsWith('❌') || rawMessage.startsWith('✅') || rawMessage.startsWith('⏰')) return rawMessage;
+    if (rawMessage.includes('Sai mật khẩu')) return rawMessage;
+    if (rawMessage.includes('chưa có Google password')) return rawMessage;
+    if (rawMessage.includes('đã bị xóa')) return rawMessage;
+    if (rawMessage.includes('chặn đăng nhập')) return rawMessage;
+    if (rawMessage.includes('xác minh số điện thoại')) return rawMessage;
+    if (rawMessage.includes('Không tìm thấy ô nhập')) return rawMessage;
+    if (rawMessage.includes('Không tìm thấy nút')) return rawMessage;
+    if (rawMessage.includes('không hợp lệ')) return rawMessage;
+    if (rawMessage.includes('đã là thành viên')) return rawMessage;
+    if (rawMessage.includes('Không xác định')) return rawMessage;
+    if (rawMessage.includes('NEEDS_VISIBLE_LOGIN')) return rawMessage;
+    if (rawMessage.includes('thử lại sau')) return rawMessage;
+
+    // Chrome/Browser crashes
+    if (msg.includes('timed out receiving message from renderer')) return '⚠ Chrome bị treo (renderer timeout) — tự động thử lại lần sau';
+    if (msg.includes('session not created')) return '⚠ Chrome lỗi session — đang reset profile, thử lại sau';
+    if (msg.includes('no such window') || msg.includes('target window already closed')) return '⚠ Chrome đã đóng bất thường — thử lại sau';
+    if (msg.includes('chrome not reachable') || msg.includes('disconnected')) return '⚠ Chrome bị mất kết nối — thử lại sau';
+    if (msg.includes('cannot find chrome binary')) return '⚠ Không tìm thấy Chrome — kiểm tra cài đặt Chrome';
+
+    // ECONNREFUSED — Chrome/ChromeDriver process died mid-session
+    if (msg.includes('econnrefused')) return '⚠ Chrome bị crash (ECONNREFUSED) — thử lại sau';
+    // Chrome crashed on startup
+    if (msg.includes('server terminated early')) return '⚠ Chrome bị crash khi khởi động — thử lại sau';
+
+    // Network & timeout
+    if (msg.includes('timeout') && msg.includes('waiting for')) return '⚠ Google load chậm (timeout) — thử lại sau';
+    if (msg.includes('timeout')) return '⚠ Hết thời gian chờ — Google có thể đang load chậm';
+    if (msg.includes('net::err_') || msg.includes('err_connection') || msg.includes('err_name_not_resolved')) return '⚠ Lỗi mạng — kiểm tra kết nối internet';
+
+    // CAPTCHA
+    if (msg.includes('captcha') || msg.includes('recaptcha') || msg.includes("i'm not a robot")) return '⚠ Google yêu cầu CAPTCHA — cần đăng nhập thủ công 1 lần';
+
+    // Selenium specific
+    if (msg.includes('stale element') || msg.includes('staleelementreference')) return '⚠ Trang Google thay đổi giữa chừng — thử lại sau';
+    if (msg.includes('element not interactable') || msg.includes('element click intercepted')) return '⚠ Không thể click trên trang Google — thử lại sau';
+    if (msg.includes('webdrivererror') || msg.includes('unknown error')) return '⚠ Lỗi Chrome driver — thử lại lần sau';
+
+    // Default — truncate long messages
+    if (rawMessage.length > 100) return '⚠ ' + rawMessage.substring(0, 100) + '...';
+    return '⚠ ' + rawMessage;
+}
+
+// ========= BROWSER CONCURRENCY CONTROL =========
+// TOTAL max 9 browsers at any time (3 visible + 6 headless).
+const MAX_TOTAL_BROWSERS = 4;
+const MAX_VISIBLE_BROWSERS = 2;
+let activeBrowsers = 0;
+let activeVisible = 0;
+const browserQueue = [];
+
+function acquireBrowserSlot(isHeadless) {
+    const SLOT_TIMEOUT = 5 * 60 * 1000; // 5 minutes max wait for a slot
+    return new Promise((resolve, reject) => {
+        const timeoutId = setTimeout(() => {
+            // Remove from queue if still waiting
+            const idx = browserQueue.findIndex(q => q.tryAcquire === tryAcquire);
+            if (idx !== -1) browserQueue.splice(idx, 1);
+            console.error(`[Browser] ⏰ Slot timeout after ${SLOT_TIMEOUT / 1000}s! Resetting counters...`);
+            // Emergency reset — slots are likely leaked
+            activeBrowsers = Math.max(0, activeBrowsers - 1);
+            reject(new Error('⏰ Hết thời gian chờ slot browser (5 phút) — có thể do Chrome zombie. Thử lại sau.'));
+        }, SLOT_TIMEOUT);
+
+        const tryAcquire = () => {
+            const hasTotal = activeBrowsers < MAX_TOTAL_BROWSERS;
+            const hasVisible = isHeadless || activeVisible < MAX_VISIBLE_BROWSERS;
+
+            if (hasTotal && hasVisible) {
+                clearTimeout(timeoutId);
+                activeBrowsers++;
+                if (!isHeadless) activeVisible++;
+                console.log(`[Browser] Slot acquired (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
+                resolve();
+            } else {
+                console.log(`[Browser] Queue waiting... (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
+                browserQueue.push({ tryAcquire });
+            }
+        };
+        tryAcquire();
+    });
+}
+
+function releaseBrowserSlot(isHeadless) {
+    activeBrowsers = Math.max(0, activeBrowsers - 1);
+    if (!isHeadless) activeVisible = Math.max(0, activeVisible - 1);
+    console.log(`[Browser] Slot released (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
+
+    // Process queued requests (FIFO = top-to-bottom order)
+    if (browserQueue.length > 0) {
+        const next = browserQueue.shift();
+        next.tryAcquire();
+    }
+}
+
+// ========= SYNC TIMEOUT =========
+const SYNC_TIMEOUT = 5 * 60 * 1000; // 5 minutes max per admin sync
+
+/**
+ * Create Chrome browser — smart headless with concurrency control:
+ * - Profile đã login (có session) → headless
+ * - Profile mới/chưa login → hiện browser để login
+ * - TOTAL max 7 browsers, visible max 3
+ */
+async function createBrowser(adminId, email, forceVisible = false) {
+    // Use email for profile dir to avoid ID collisions between databases
+    const safeEmail = (email || `admin_${adminId}`).replace(/[^a-zA-Z0-9]/g, '_');
+    const profileDir = path.join(BROWSER_DATA_DIR, `profile_${safeEmail}`);
+    if (!fs.existsSync(profileDir)) {
+        fs.mkdirSync(profileDir, { recursive: true });
+    }
+
+    // Check if admin has VALID session — last sync was successful = can try headless
+    // If session actually expired, NEEDS_VISIBLE_LOGIN retry will handle it
+    const adminRecord = await db.prepare('SELECT last_sync, sync_status FROM admins WHERE id = ?').get(adminId);
+    const lastSyncOk = !!(adminRecord && adminRecord.sync_status === 'success');
+
+    const useHeadless = lastSyncOk && !forceVisible;
+    if (!useHeadless) {
+        console.log(`[Scraper] Farm ${adminId}: visible mode (lastSyncOk=${lastSyncOk}, force=${forceVisible})`);
+    }
+
+    // Wait for browser slot
+    await acquireBrowserSlot(useHeadless);
+
+    // Clean up stale lock files from crashed Chrome sessions
+    const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+    for (const lf of lockFiles) {
+        const lockPath = path.join(profileDir, lf);
+        try { if (fs.existsSync(lockPath)) fs.unlinkSync(lockPath); } catch { }
+    }
+
+    const options = new chrome.Options();
+    options.addArguments(`--user-data-dir=${profileDir}`);
+
+    // Common stability flags — prevent crashes & ECONNREFUSED
+    options.addArguments('--no-first-run');
+    options.addArguments('--no-default-browser-check');
+    options.addArguments('--disable-infobars');
+    options.addArguments('--disable-extensions');
+    options.addArguments('--disable-blink-features=AutomationControlled');
+    options.addArguments('--disable-dev-shm-usage');
+    options.addArguments('--no-sandbox');
+    options.addArguments('--disable-gpu');
+    options.addArguments('--disable-hang-monitor');       // prevent false "renderer timeout" kills
+    options.addArguments('--disable-breakpad');            // disable crash reporter
+    options.addArguments('--disable-component-update');    // prevent mid-session updates
+    options.addArguments('--disable-background-timer-throttling');
+    options.addArguments('--disable-backgrounding-occluded-windows');
+    options.addArguments('--disable-ipc-flooding-protection');
+    options.excludeSwitches('enable-automation');
+
+    if (useHeadless) {
+        options.addArguments('--headless=new');
+        // Memory-saving flags for headless (~80-100MB per browser)
+        options.addArguments('--disable-software-rasterizer');
+        options.addArguments('--js-flags=--max-old-space-size=256');  // 256MB heap (64 was too low, caused OOM crashes)
+        options.addArguments('--disable-remote-fonts');
+        options.addArguments('--disable-logging');
+        options.addArguments('--log-level=3');
+        options.addArguments('--disable-background-networking');
+        options.addArguments('--disable-default-apps');
+        options.addArguments('--disable-sync');
+        options.addArguments('--disable-translate');
+        options.addArguments('--disable-features=TranslateUI');
+        options.addArguments('--window-size=800,600');
+        console.log(`[Scraper] 🔒 Headless mode`);
+    } else {
+        options.addArguments('--window-size=1100,800');
+        console.log(`[Scraper] 👁 Visible mode`);
+    }
+
+    console.log(`[Scraper] Creating Chrome browser for admin ${adminId}...`);
+
+    let driver;
+    try {
+        driver = await new Builder()
+            .forBrowser('chrome')
+            .setChromeOptions(options)
+            .build();
+    } catch (buildErr) {
+        const errMsg = buildErr.message || '';
+        console.error(`[Scraper] ❌ Browser build failed for admin ${adminId}: ${errMsg.substring(0, 200)}`);
+
+        // Auto-retry: if "session not created" (corrupt profile / resource exhaustion)
+        if (errMsg.includes('session not created') || errMsg.includes('DevToolsActivePort') || errMsg.includes('crashed')) {
+            console.log(`[Scraper] ⚠ Session error for admin ${adminId}, cleaning up and retrying...`);
+
+            // NOTE: Do NOT kill all chromedriver here — would crash other active browsers
+            // Only clean the profile directory and retry
+
+            // Step 2: Delete and recreate profile
+            try { fs.rmSync(profileDir, { recursive: true, force: true }); } catch { }
+            fs.mkdirSync(profileDir, { recursive: true });
+
+            // Step 3: Wait for system resources to settle
+            await new Promise(r => setTimeout(r, 2000));
+
+            try {
+                driver = await new Builder()
+                    .forBrowser('chrome')
+                    .setChromeOptions(options)
+                    .build();
+                console.log(`[Scraper] ✓ Retry successful for admin ${adminId}`);
+            } catch (retryErr) {
+                console.error(`[Scraper] ❌ Retry also failed for admin ${adminId}: ${(retryErr.message || '').substring(0, 200)}`);
+                // CRITICAL: release slot if browser build fails completely
+                releaseBrowserSlot(useHeadless);
+                throw retryErr;
+            }
+        } else {
+            // CRITICAL: release slot if browser build fails
+            releaseBrowserSlot(useHeadless);
+            throw buildErr;
+        }
+    }
+
+    // Tag driver with headless info for slot release
+    driver._isHeadless = useHeadless;
+
+    // Set page load timeout (30s for headless, 60s for visible)
+    try {
+        await driver.manage().setTimeouts({
+            pageLoad: useHeadless ? 30000 : 60000,
+            script: useHeadless ? 10000 : 30000
+        });
+    } catch { }
+
+    console.log('[Scraper] ✓ Chrome browser created');
+    return driver;
+}
+
+/**
+ * Smart sleep — headless browsers load faster, no animations to wait for
+ * Cuts wait time by 50% for headless, keeps full time for visible browsers
+ */
+async function smartSleep(driver, ms) {
+    const actual = driver._isHeadless ? Math.round(ms * 0.5) : ms;
+    await driver.sleep(actual);
+}
+
+// ========= AUTO LOGIN (same pattern as MY_BOT GoogleLoginAutomation) =========
+
+/**
+ * Generate TOTP code from secret
+ */
+function generateTOTP(secret) {
+    const cleanSecret = secret.replace(/\s+/g, '').toUpperCase();
+    const totp = new OTPAuth.TOTP({
+        secret: OTPAuth.Secret.fromBase32(cleanSecret),
+        digits: 6, period: 30, algorithm: 'SHA1'
+    });
+    return totp.generate();
+}
+
+/**
+ * Helper: wait for element with multiple possible selectors (same as MY_BOT _wait_and_find)
+ */
+async function waitAndFind(driver, selectors, timeoutMs = 10000) {
+    const endTime = Date.now() + timeoutMs;
+    while (Date.now() < endTime) {
+        for (const selector of selectors) {
+            try {
+                const el = await driver.findElement(By.css(selector));
+                if (await el.isDisplayed()) return el;
+            } catch { }
+        }
+        await smartSleep(driver, 500);
+    }
+    return null;
+}
+
+/**
+ * Helper: safe click (same as MY_BOT _safe_click - uses JS click as fallback)
+ */
+async function safeClick(driver, element) {
+    try {
+        await element.click();
+    } catch {
+        try {
+            await driver.executeScript('arguments[0].click()', element);
+        } catch { }
+    }
+}
+
+/**
+ * Helper: safe fill input — uses JavaScript injection (atomic per-browser)
+ * sendKeys() interleaves keystrokes between multiple concurrent browsers on Windows.
+ * JS injection sets value directly in the DOM — instant, no interleaving.
+ * Fires comprehensive events needed for Google Material Design forms.
+ */
+async function safeFill(driver, element, text) {
+    const str = text ? String(text) : '';
+    try {
+        await element.click();
+        await smartSleep(driver, 200);
+    } catch { /* element may not be clickable, continue */ }
+    // Use JavaScript to set value atomically — no keystroke interleaving
+    // Fire all events that Google's Material Design forms listen for
+    await driver.executeScript(`
+        const el = arguments[0];
+        const val = arguments[1];
+        el.focus();
+        // Clear existing value
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLInputElement.prototype, 'value'
+        ).set;
+        nativeSetter.call(el, '');
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        // Set new value
+        nativeSetter.call(el, val);
+        // Fire comprehensive events for Google forms
+        el.dispatchEvent(new Event('focus', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'a' }));
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: 'a' }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    `, element, str);
+}
+
+/**
+ * Auto Google Login (replicates MY_BOT GoogleLoginAutomation.login exactly)
+ */
+async function googleLogin(driver, email, password, totpSecret, adminId) {
+    // Step 1: Navigate to credit page (requires auth - will redirect to login if not logged in)
+    console.log('[Login] Navigating to Google One credit page (requires auth)...');
+    syncStatus[adminId].message = 'Đang mở Google One...';
+    await driver.get(CREDIT_URL);
+    await smartSleep(driver, 5000);
+
+    // Check if already logged in
+    let currentUrl = await driver.getCurrentUrl();
+    console.log(`[Login] URL: ${currentUrl}`);
+
+    // If we're on the credit page and NOT on login page or /about/ page = logged in
+    const needsLogin = currentUrl.includes('accounts.google.com') || currentUrl.includes('/about/') || currentUrl.includes('/about');
+    if (!needsLogin && currentUrl.includes('one.google.com')) {
+        // Verify we're logged into the CORRECT account
+        console.log('[Login] Session exists, verifying account...');
+        syncStatus[adminId].message = 'Đang kiểm tra tài khoản...';
+        try {
+            await driver.get('https://myaccount.google.com/personal-info');
+            await smartSleep(driver, 3000);
+            const pageText = await driver.findElement(By.css('body')).getText();
+            if (pageText.toLowerCase().includes(email.toLowerCase())) {
+                console.log(`[Login] ✓ Correct account: ${email}`);
+                return true;
+            } else {
+                console.log(`[Login] ✗ Wrong account! Expected ${email}, signing out...`);
+                syncStatus[adminId].message = 'Sai tài khoản, đang đăng xuất...';
+                await driver.get('https://accounts.google.com/Logout');
+                await smartSleep(driver, 3000);
+                // Navigate back to login
+                await driver.get('https://accounts.google.com/signin/v2/identifier?continue=' + encodeURIComponent(CREDIT_URL) + '&flowName=GlifWebSignIn&flowEntry=ServiceLogin');
+                await smartSleep(driver, 3000);
+                currentUrl = await driver.getCurrentUrl();
+            }
+        } catch (e) {
+            console.log('[Login] Account verify failed:', e.message, '— proceeding to login');
+        }
+    }
+
+    // If redirected to /about/ (public page), go to login
+    if (currentUrl.includes('/about')) {
+        console.log('[Login] Redirected to public page, navigating to accounts.google.com...');
+        await driver.get('https://accounts.google.com/signin/v2/identifier?continue=' + encodeURIComponent(CREDIT_URL) + '&flowName=GlifWebSignIn&flowEntry=ServiceLogin');
+        await smartSleep(driver, 3000);
+        currentUrl = await driver.getCurrentUrl();
+        console.log(`[Login] Login page URL: ${currentUrl}`);
+    }
+
+    // If login needed but browser is headless → abort and retry visible
+    if (driver._isHeadless) {
+        console.log('[Login] ⚠ Login needed but running headless — need visible browser!');
+        throw new Error('NEEDS_VISIBLE_LOGIN');
+    }
+
+    console.log('[Login] Login needed, proceeding with auto-login...');
+
+    // Step 2: Find email input (same selectors as MY_BOT)
+    console.log('[Login] Finding email field...');
+    syncStatus[adminId].message = 'Đang nhập email...';
+
+    let emailInput = await waitAndFind(driver, ['input[type="email"]', '#identifierId'], 15000);
+
+    // Handle "Choose an account" page (same as MY_BOT)
+    if (!emailInput) {
+        try {
+            const pageSource = await driver.getPageSource();
+            if (pageSource.includes('chọn tài khoản') || pageSource.includes('Choose an account') || pageSource.includes('Chọn một tài khoản')) {
+                console.log('[Login] "Choose account" page detected, clicking "Use another account"');
+                const useAnother = await driver.findElement(By.xpath(
+                    "//*[contains(text(), 'Sử dụng một tài khoản khác') or contains(text(), 'Use another account')]"
+                ));
+                await safeClick(driver, useAnother);
+                await smartSleep(driver, 2000);
+                emailInput = await waitAndFind(driver, ['input[type="email"]', '#identifierId'], 10000);
+            }
+        } catch (e) {
+            console.log('[Login] Choose account handling:', e.message);
+        }
+    }
+
+    if (!emailInput) {
+        throw new Error('Không tìm thấy ô nhập email');
+    }
+
+    // Enter email
+    console.log('[Login] Typing email...');
+    await safeFill(driver, emailInput, email);
+    await smartSleep(driver, 1000);
+
+    // Click Next (same selectors as MY_BOT)
+    const nextBtn = await waitAndFind(driver, ['#identifierNext', '#identifierNext button', 'button[jsname="LgbsSe"]'], 3000);
+    if (nextBtn) {
+        await safeClick(driver, nextBtn);
+    } else {
+        await emailInput.sendKeys(Key.RETURN);
+    }
+
+    await smartSleep(driver, 4000);
+
+    // Check for account deleted/errors
+    try {
+        const pageSource = await driver.getPageSource();
+        if (pageSource.includes('Không tìm thấy') || pageSource.includes('Couldn\'t find')) {
+            throw new Error('Tài khoản không tồn tại');
+        }
+    } catch (e) {
+        if (e.message.includes('Tài khoản')) throw e;
+    }
+
+    // Step 3: Enter password (same as MY_BOT)
+    console.log('[Login] Finding password field...');
+    syncStatus[adminId].message = 'Đang nhập mật khẩu...';
+
+    const passwordInput = await waitAndFind(driver, ['input[type="password"]'], 15000);
+    if (!passwordInput) {
+        syncStatus[adminId].message = '❌ Không tìm thấy ô mật khẩu — Google yêu cầu xác minh!';
+        throw new Error('Không tìm thấy ô nhập mật khẩu — Google có thể đang yêu cầu xác minh bổ sung');
+    }
+
+    console.log('[Login] Typing password...');
+    await safeFill(driver, passwordInput, password);
+    await smartSleep(driver, 1000);
+
+    // Click Next
+    const passBtn = await waitAndFind(driver, ['#passwordNext', '#passwordNext button', 'button[jsname="LgbsSe"]'], 3000);
+    if (passBtn) {
+        await safeClick(driver, passBtn);
+    } else {
+        await passwordInput.sendKeys(Key.RETURN);
+    }
+
+    await smartSleep(driver, 5000);
+
+    // Check for login errors
+    try {
+        const pageSource = await driver.getPageSource();
+        if (pageSource.includes('Sai mật khẩu') || pageSource.includes('Wrong password')) {
+            syncStatus[adminId].message = '❌ Sai mật khẩu — hãy cập nhật password!';
+            throw new Error('Sai mật khẩu — hãy cập nhật password!');
+        }
+        if (pageSource.includes('đã bị xóa') || pageSource.includes('has been deleted')) {
+            syncStatus[adminId].message = '❌ Tài khoản đã bị xóa!';
+            throw new Error('Tài khoản đã bị xóa');
+        }
+        if (pageSource.includes('chặn đăng nhập') || pageSource.includes('blocked sign-in')) {
+            syncStatus[adminId].message = '❌ Google chặn đăng nhập!';
+            throw new Error('Google đã chặn đăng nhập từ thiết bị này');
+        }
+    } catch (e) {
+        if (e.message.includes('Sai') || e.message.includes('xóa') || e.message.includes('chặn')) throw e;
+    }
+
+    // Step 4: Handle 2FA / TOTP
+    currentUrl = await driver.getCurrentUrl();
+    console.log(`[Login] Post-password URL: ${currentUrl}`);
+
+    // Detect phone verification (can't automate — tell user to remove phone, use TOTP only)
+    // BUT: skip if the page ALSO has an Authenticator option (selection page with multiple options)
+    if (currentUrl.includes('challenge')) {
+        try {
+            const pageSource = await driver.getPageSource();
+            const phoneKeywords = [
+                'Open the Gmail app', 'Mở ứng dụng Gmail',
+                'verify your phone', 'xác minh điện thoại',
+                'sent a notification', 'đã gửi thông báo',
+                'Tap Yes on the prompt', 'Nhấn Có trên lời nhắc',
+                'Open the Gmail app on iPhone', 'Open the Gmail app on Android'
+            ];
+            const isPhoneChallenge = phoneKeywords.some(kw => pageSource.includes(kw));
+            const hasTotpInput = pageSource.includes('totpPin') || pageSource.includes('name="totpPin"');
+            const hasAuthenticatorOption = pageSource.includes('Authenticator') || pageSource.includes('verification code');
+
+            // Only throw phone error if there's NO Authenticator option and NO TOTP input
+            if (isPhoneChallenge && !hasTotpInput && !hasAuthenticatorOption) {
+                console.log('[Login] ❌ Phone verification ONLY — cannot automate');
+                syncStatus[adminId].message = '❌ Yêu cầu xác minh SĐT — hãy xóa Phone, chỉ dùng 2FA!';
+                throw new Error('Tài khoản yêu cầu xác minh số điện thoại. Hãy xóa phone verification và chỉ để 2FA (TOTP).');
+            }
+            if (isPhoneChallenge && hasAuthenticatorOption) {
+                console.log('[Login] Phone + Authenticator options found — will click Authenticator');
+            }
+        } catch (e) {
+            if (e.message.includes('xác minh số điện thoại')) throw e;
+        }
+    }
+
+    // Check if we need 2FA — skip if already on Google One (login succeeded without 2FA)
+    if (currentUrl.includes('one.google.com') && !currentUrl.includes('accounts.google.com')) {
+        console.log('[Login] ✓ Already on Google One — no 2FA needed');
+    } else if (totpSecret && (currentUrl.includes('challenge') || currentUrl.includes('signin/v2'))) {
+        console.log('[Login] 2FA challenge detected, entering TOTP...');
+        syncStatus[adminId].message = 'Đang nhập mã 2FA...';
+
+        // Google may show "Choose how you want to sign in" page — click TOTP/Authenticator option
+        try {
+            // Method 1: data attribute selector
+            let totpOption = await waitAndFind(driver, [
+                '[data-challengetype="6"]',
+                'div[data-challengeid="6"]'
+            ], 3000);
+
+            // Method 2: text-based — uses "." instead of "text()" to match text inside child elements (e.g. <b>Google</b> Authenticator)
+            if (!totpOption) {
+                const xpaths = [
+                    "//*[contains(., 'Authenticator') and not(self::script)]",
+                    "//*[contains(., 'verification code') and contains(., 'Authenticator')]",
+                    "//*[contains(., 'mã xác minh') and contains(., 'Authenticator')]"
+                ];
+                for (const xp of xpaths) {
+                    try {
+                        const els = await driver.findElements(By.xpath(xp));
+                        // Click the most specific (smallest/deepest) element
+                        for (const el of els) {
+                            const tag = await el.getTagName();
+                            if (['li', 'div', 'button', 'a', 'span'].includes(tag.toLowerCase())) {
+                                totpOption = el;
+                                break;
+                            }
+                        }
+                        if (totpOption) break;
+                    } catch { }
+                }
+            }
+
+            if (totpOption) {
+                console.log('[Login] Found TOTP/Authenticator option, clicking...');
+                await safeClick(driver, totpOption);
+                await smartSleep(driver, 3000);
+            } else {
+                console.log('[Login] No Authenticator option found on selection page');
+            }
+        } catch { }
+
+        // Find TOTP input field
+        const totpInput = await waitAndFind(driver, [
+            'input[name="totpPin"]',
+            'input[type="tel"]',
+            '#totpPin',
+            'input[id="totpPin"]'
+        ], 10000);
+
+        if (totpInput) {
+            const code = generateTOTP(totpSecret);
+            console.log(`[Login] Entering TOTP code: ${code}`);
+
+            await safeFill(driver, totpInput, code);
+            await smartSleep(driver, 1000);
+
+            // Click Next/Verify
+            const verifyBtn = await waitAndFind(driver, [
+                '#totpNext',
+                '#totpNext button',
+                'button[jsname="LgbsSe"]'
+            ], 3000);
+            if (verifyBtn) {
+                await safeClick(driver, verifyBtn);
+            } else {
+                await totpInput.sendKeys(Key.RETURN);
+            }
+
+            await smartSleep(driver, 8000);
+
+            // Check if we made it past — success = NOT on challenge page anymore
+            try {
+                const postTotpUrl = await driver.getCurrentUrl();
+                console.log(`[Login] Post-TOTP URL: ${postTotpUrl}`);
+
+                // If we landed on Google One or myaccount = TOTP worked!
+                if (postTotpUrl.includes('one.google.com') || postTotpUrl.includes('myaccount.google.com')) {
+                    console.log('[Login] ✓ TOTP accepted, login successful');
+                } else if (postTotpUrl.includes('challenge')) {
+                    // Still on challenge — check if there's an actual error message
+                    const postTotpSource = await driver.getPageSource();
+                    const wrongCodeKeywords = [
+                        'Wrong code', 'Sai mã', 'incorrect', 'Mã không đúng',
+                        'Try again', 'Thử lại', 'không hợp lệ', 'invalid'
+                    ];
+                    const isWrongCode = wrongCodeKeywords.some(kw => postTotpSource.includes(kw));
+
+                    if (isWrongCode) {
+                        syncStatus[adminId].message = '❌ Sai mã 2FA — hãy kiểm tra lại TOTP secret!';
+                        throw new Error('Sai mã 2FA — TOTP secret có thể sai hoặc hết hạn');
+                    }
+                    // No error text but still on challenge — may just be slow, continue anyway
+                    console.log('[Login] Still on challenge page but no error text — continuing...');
+                }
+            } catch (e) {
+                if (e.message.includes('2FA')) throw e;
+            }
+        } else {
+            console.log('[Login] ❌ Could not find TOTP input — skipping');
+            syncStatus[adminId].message = '❌ Không tìm thấy ô 2FA — hãy kiểm tra lại TOTP secret!';
+            throw new Error('Không tìm thấy ô nhập 2FA — TOTP secret có thể sai');
+        }
+    }
+
+    // Step 5: Verify login success
+    await smartSleep(driver, 3000);
+    currentUrl = await driver.getCurrentUrl();
+    console.log(`[Login] Final URL: ${currentUrl}`);
+
+    // Navigate to Google One if not there
+    if (!currentUrl.includes('one.google.com')) {
+        await driver.get('https://one.google.com/');
+        await smartSleep(driver, 3000);
+        currentUrl = await driver.getCurrentUrl();
+    }
+
+    if (currentUrl.includes('one.google.com') && !currentUrl.includes('accounts.google.com')) {
+        console.log('[Login] ✓ Login successful!');
+        return true;
+    }
+
+    syncStatus[adminId].message = '❌ Đăng nhập không thành công!';
+    throw new Error('Đăng nhập không thành công - URL: ' + currentUrl.substring(0, 100));
+}
+
+// ========= MAIN SYNC FUNCTION =========
+
+async function syncAdmin(adminId) {
+    const admin = await db.prepare('SELECT * FROM admins WHERE id = ?').get(adminId);
+    if (!admin) throw new Error('Admin not found');
+
+    // Decrypt password
+    let googlePassword = '';
+    console.log(`[Sync] Admin ${adminId}: google_password field = ${admin.google_password ? `"${admin.google_password.substring(0, 20)}..." (${admin.google_password.length} chars)` : 'EMPTY/NULL'}`);
+    if (admin.google_password) {
+        try {
+            googlePassword = decrypt(admin.google_password) || '';
+            console.log(`[Sync] Admin ${adminId}: decrypted password = ${googlePassword ? 'OK (' + googlePassword.length + ' chars)' : 'EMPTY'}`);
+        } catch (e) {
+            console.error(`[Sync] Admin ${adminId}: decrypt FAILED:`, e.message);
+            googlePassword = '';
+        }
+    }
+    if (!googlePassword) {
+        console.log(`[Sync] Admin ${adminId}: Bỏ qua - chưa có Google password`);
+        syncStatus[adminId] = { status: 'done', message: 'Bỏ qua - chưa có password', last_sync: null };
+        return null;
+    }
+
+    syncStatus[adminId] = { status: 'syncing', message: 'Đang chờ...', last_sync: null };
+    let driver = null;
+    let isHeadless = true;
+    let slotAcquired = false; // Track if WE hold a slot (createBrowser releases on its own failure)
+    let watchdog = null;
+
+    try {
+        driver = await createBrowser(adminId, admin.email);
+        slotAcquired = true; // createBrowser succeeded = we hold the slot
+        isHeadless = driver._isHeadless;
+        syncStatus[adminId].message = 'Đang mở Google One...';
+
+        // Watchdog: force-kill browser if sync takes > 5 minutes
+        watchdog = setTimeout(async () => {
+            console.log(`[Scraper] ⏰ Watchdog: admin ${adminId} exceeded ${SYNC_TIMEOUT / 1000}s, killing browser`);
+            syncStatus[adminId] = { status: 'error', message: `⏰ Đồng bộ quá ${SYNC_TIMEOUT / 60000} phút — tự động dừng. Google có thể load chậm, thử lại sau.`, last_sync: null };
+            if (driver) {
+                try { await forceKillDriver(driver); } catch (e) { console.error('[Watchdog] forceKillDriver failed:', e.message); try { await driver.quit(); } catch { } }
+                driver = null;
+            }
+        }, SYNC_TIMEOUT);
+
+        // Auto login — if headless detects login needed, retry with visible
+        try {
+            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+        } catch (loginErr) {
+            if (loginErr.message === 'NEEDS_VISIBLE_LOGIN') {
+                console.log(`[Scraper] Admin ${adminId}: session expired, retrying with visible browser...`);
+                try { await driver.quit(); } catch { }
+                releaseBrowserSlot(isHeadless);
+                slotAcquired = false;
+                driver = null;
+
+                // Mark sync_status so next time it starts visible directly
+                try { await db.prepare('UPDATE admins SET sync_status = ? WHERE id = ?').run('error: session expired', adminId); } catch { }
+
+                // Reopen as visible
+                driver = await createBrowser(adminId, admin.email, true);
+                slotAcquired = true;
+                isHeadless = false;
+
+                // Reset watchdog
+                if (watchdog) clearTimeout(watchdog);
+                watchdog = setTimeout(async () => {
+                    console.log(`[Scraper] ⏰ Watchdog: admin ${adminId} exceeded ${SYNC_TIMEOUT / 1000}s, killing browser`);
+                    syncStatus[adminId] = { status: 'error', message: `⏰ Đồng bộ quá ${SYNC_TIMEOUT / 60000} phút — tự động dừng. Google có thể load chậm, thử lại sau.`, last_sync: null };
+                    if (driver) { try { await forceKillDriver(driver); } catch (e) { try { await driver.quit(); } catch { } } driver = null; }
+                }, SYNC_TIMEOUT);
+
+                await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            } else {
+                throw loginErr;
+            }
+        }
+
+        // Check plan status FIRST (before scraping data)
+        const planStatus = await checkPlanStatus(driver, adminId);
+        if (planStatus === 'expired') {
+            syncStatus[adminId].message = '⚠ Gói Google One đã hết hạn!';
+            console.log(`[Scraper] Admin ${adminId}: plan expired, still scraping remaining data...`);
+        }
+
+        // Scrape credits
+        syncStatus[adminId].message = 'Đang lấy dữ liệu credit...';
+        let creditData;
+        try {
+            creditData = await scrapeCredits(driver);
+        } catch (e) {
+            console.error('[Scraper] Credit scrape error:', e.message);
+            creditData = { monthlyCredits: 0, bonusCredits: 0, memberUsage: [] };
+        }
+
+        // Scrape family members
+        syncStatus[adminId].message = 'Đang lấy danh sách thành viên gia đình...';
+        let familyMembers;
+        try {
+            familyMembers = await scrapeFamily(driver, adminId, admin.email);
+        } catch (e) {
+            console.error('[Scraper] Family scrape error:', e.message);
+            familyMembers = [];
+        }
+
+        // Scrape storage
+        syncStatus[adminId].message = 'Đang lấy dữ liệu bộ nhớ...';
+        let storageData;
+        try {
+            storageData = await scrapeStorage(driver);
+        } catch (e) {
+            console.error('[Scraper] Storage scrape error:', e.message);
+            storageData = { totalStorage: '30 TB', totalUsed: '0 GB', driveGB: 0, gmailGB: 0, photosGB: 0, familyStorage: [] };
+        }
+
+        // Save to DB
+        syncStatus[adminId].message = 'Đang lưu dữ liệu...';
+        await saveData(adminId, creditData, storageData);
+
+        const now = new Date().toISOString();
+        await db.prepare('UPDATE admins SET last_sync = ?, sync_status = ? WHERE id = ?').run(now, 'success', adminId);
+
+        syncStatus[adminId] = {
+            status: 'done',
+            message: `✅ Sync thành công! Credits còn: ${creditData.monthlyCredits}`,
+            last_sync: now,
+            data: { credits: creditData, storage: storageData }
+        };
+
+        return { credits: creditData, storage: storageData };
+
+    } catch (err) {
+        console.error(`[Scraper] Error syncing admin ${adminId}:`, err.message);
+        const friendlyMsg = classifyScraperError(err.message);
+        try { await db.prepare('UPDATE admins SET sync_status = ? WHERE id = ?').run('error: ' + friendlyMsg, adminId); } catch { }
+        syncStatus[adminId] = { status: 'error', message: friendlyMsg, last_sync: null };
+        throw new Error(friendlyMsg);
+
+    } finally {
+        if (watchdog) clearTimeout(watchdog);
+        if (driver) {
+            try { await forceKillDriver(driver); } catch (e) {
+                console.error('[Sync] forceKillDriver failed:', e.message);
+                try { await driver.quit(); } catch { }
+            }
+        }
+        // Auto-clean heavy browser data (keep cookies/session)
+        try { cleanBrowserProfile(admin.email || `admin_${adminId}`); } catch { }
+        // Only release slot if WE still hold it (createBrowser releases on its own failure)
+        if (slotAcquired) releaseBrowserSlot(isHeadless);
+    }
+}
+
+// ========= PLAN STATUS CHECK =========
+// Check Google One HOME page for plan status
+const GOOGLE_ONE_HOME = 'https://one.google.com/home?g1_landing_page=0&hl=vi-VN';
+
+async function checkPlanStatus(driver, adminId) {
+    console.log(`[PlanCheck] Admin ${adminId}: Starting plan check...`);
+    syncStatus[adminId].message = 'Đang kiểm tra gói đăng ký...';
+
+    try {
+        // Go to Google One HOME page (more reliable than plans page)
+        await driver.get(GOOGLE_ONE_HOME);
+        await driver.sleep(8000);
+
+        const bodyText = await driver.executeScript('return document.body.innerText') || '';
+        const pageUrl = await driver.getCurrentUrl();
+
+        console.log(`[PlanCheck] Admin ${adminId}: URL = ${pageUrl}`);
+        console.log(`[PlanCheck] Admin ${adminId}: Body text (500 chars) = ${bodyText.substring(0, 500)}`);
+
+        // Check 1: Storage amount — "30 TB" or "2 TB" = has paid plan, "15 GB" only = free/no plan
+        const has30TB = bodyText.includes('30 TB');
+        const has2TB = bodyText.includes('2 TB');
+        const has100GB = bodyText.includes('100 GB') && bodyText.includes('Gói hiện tại');
+        const has200GB = bodyText.includes('200 GB') && bodyText.includes('Gói hiện tại');
+        const has15GBonly = bodyText.includes('15 GB') && !has30TB && !has2TB;
+
+        // Check 2: "Gói hiện tại" text — only shows for active plans
+        const hasCurrentPlan = bodyText.includes('Gói hiện tại') || bodyText.includes('Current plan');
+
+        console.log(`[PlanCheck] Admin ${adminId}: 30TB=${has30TB}, 2TB=${has2TB}, 15GBonly=${has15GBonly}, currentPlan=${hasCurrentPlan}`);
+
+        // ACTIVE: has large storage OR "Gói hiện tại" text
+        if (has30TB || has2TB || has100GB || has200GB || hasCurrentPlan) {
+            console.log(`[PlanCheck] Admin ${adminId}: ✅ ACTIVE`);
+            await db.prepare('UPDATE admins SET plan_status = ? WHERE id = ?').run('active', adminId);
+            return 'active';
+        }
+
+        // EXPIRED: only 15GB or no plan indicator found
+        console.log(`[PlanCheck] Admin ${adminId}: ❌ EXPIRED — no paid plan detected`);
+        await db.prepare('UPDATE admins SET plan_status = ? WHERE id = ?').run('expired', adminId);
+        return 'expired';
+
+    } catch (err) {
+        console.error(`[PlanCheck] Admin ${adminId}: ERROR — ${err.message}`);
+        try { await db.prepare('UPDATE admins SET plan_status = ? WHERE id = ?').run('expired', adminId); } catch { }
+        return 'expired';
+    }
+}
+
+// ========= SCRAPING FUNCTIONS =========
+
+async function scrapeCredits(driver) {
+    console.log('[Scraper] Navigating to credits page...');
+    await driver.get(CREDIT_URL);
+    await driver.sleep(8000); // FULL wait — page must render credit numbers
+
+    let monthlyCredits = 0, bonusCredits = 0, memberUsage = [];
+
+    try {
+        let els = await driver.findElements(By.css('.wAlWod'));
+        let texts = [];
+        for (const el of els) {
+            const text = await el.getText();
+            texts.push(text.trim());
+        }
+        console.log(`[Scraper] Credit elements (1st try): ${JSON.stringify(texts)}`);
+
+        // Retry if empty — page may not have loaded fully
+        if (texts.length === 0 || texts.every(t => !t)) {
+            console.log('[Scraper] Credits empty, retrying after 5s...');
+            await driver.sleep(5000);
+            els = await driver.findElements(By.css('.wAlWod'));
+            texts = [];
+            for (const el of els) {
+                const text = await el.getText();
+                texts.push(text.trim());
+            }
+            console.log(`[Scraper] Credit elements (2nd try): ${JSON.stringify(texts)}`);
+        }
+
+        if (texts.length > 0) monthlyCredits = parseCreditsNumber(texts[0]);
+        if (texts.length > 1) bonusCredits = parseCreditsNumber(texts[1]);
+    } catch (err) {
+        console.error('[Scraper] Error reading credits:', err.message);
+    }
+
+    // Parse family member usage - support both Vietnamese and English
+    try {
+        // Scroll down to ensure all family members are loaded
+        await driver.executeScript('window.scrollTo(0, document.body.scrollHeight)');
+        await smartSleep(driver, 2000);
+        await driver.executeScript('window.scrollTo(0, document.body.scrollHeight)');
+        await smartSleep(driver, 2000);
+
+        const pageText = await driver.findElement(By.css('body')).getText();
+        console.log('[Scraper] Credits page text (last 1500):', pageText.substring(Math.max(0, pageText.length - 1500)));
+
+        // Split at the family section header - try multiple languages
+        let familyText = '';
+        const familySplitters = [
+            'nhóm gia đình',           // Vietnamese
+            'family group members',     // English
+            'family group',             // English short
+            'thành viên trong nhóm'     // Vietnamese alt
+        ];
+        for (const splitter of familySplitters) {
+            const idx = pageText.toLowerCase().indexOf(splitter);
+            if (idx !== -1) {
+                familyText = pageText.substring(idx);
+                console.log(`[Scraper] Found family section via "${splitter}"`);
+                break;
+            }
+        }
+
+        if (familyText) {
+            // getText() returns name and amount on SEPARATE lines:
+            // Line i:   "Hieu Nguyen"
+            // Line i+1: "-2,900"
+            const lines = familyText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+            const SKIP_WORDS = ['credit', 'tín dụng', 'manage', 'quản lý', 'activity', 'hoạt động', 'add', 'thêm', 'group', 'nhóm'];
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const nextLine = (lines[i + 1] || '').trim();
+
+                // Next line must be a number (possibly negative, with comma/dot separators)
+                const amountMatch = nextLine.match(/^-?([\d,.]+)$/);
+                if (!amountMatch) continue;
+
+                // Current line must look like a name (letters, not starting with number/symbol)
+                if (line.length < 2 || line.length > 50) continue;
+                if (/^\d/.test(line) || /^[+\-*]/.test(line)) continue;
+                const lineLower = line.toLowerCase();
+                if (SKIP_WORDS.some(w => lineLower.includes(w))) continue;
+                if (line.includes('http') || line.includes('@')) continue;
+
+                const name = line.trim();
+                const amount = parseCreditsNumber(amountMatch[1]);
+                if (amount > 0) {
+                    memberUsage.push({ name, amount });
+                    console.log(`[Scraper] ✓ Member credit: "${name}" = ${amount}`);
+                }
+            }
+        }
+    } catch (err) {
+        console.error('[Scraper] Error reading member usage:', err.message);
+    }
+
+    console.log(`[Scraper] Credits: monthly=${monthlyCredits}, members=${JSON.stringify(memberUsage)}`);
+    return { monthlyCredits, bonusCredits, memberUsage };
+}
+
+/**
+ * Scrape family members from Google Account family page
+ * Supports English and Vietnamese. Strict exact-word matching only.
+ */
+async function scrapeFamily(driver, adminId, adminEmail) {
+    const FAMILY_URL = 'https://myaccount.google.com/family/details?utm_source=g1web&utm_medium=default';
+    console.log('[Scraper] Navigating to family page...');
+    await driver.get(FAMILY_URL);
+    await smartSleep(driver, 5000);
+
+    const familyMembers = [];
+
+    // Blacklist - page section titles that are NOT member names
+    const BLACKLIST = [
+        'storage', 'premium', 'benefits', 'password', 'sharing', 'delete',
+        'family group', 'send invitations', 'learn more', 'tìm hiểu',
+        'gửi lời mời', 'xóa', 'bộ nhớ', 'mật khẩu', 'chia sẻ',
+        'giải trí', 'tổ chức', 'khám phá', 'google', 'youtube',
+        'account storage', 'shared with'
+    ];
+
+    try {
+        const pageText = await driver.findElement(By.css('body')).getText();
+        console.log('[Scraper] Family page text (first 1500):', pageText.substring(0, 1500));
+        const lines = pageText.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+
+        const memberNames = [];
+
+        // STRICT exact match only - no substring!
+        const MEMBER_EXACT = ['member', 'thành viên'];
+        const MANAGER_EXACT = ['family manager', 'người quản lý gia đình'];
+
+        // Also detect pending invitations
+        const PENDING_KEYWORDS = ['lời mời sẽ hết hạn', 'invitation expires', 'lời mời đã được gửi', 'invitation sent', 'hết hạn vào'];
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            const nextLine = (lines[i + 1] || '').toLowerCase().trim();
+            const prevLine = (lines[i - 1] || '').toLowerCase().trim();
+
+            // Check for pending invitation: look for email on this line + invitation text on same/next line
+            // OR invitation text on this line + email on previous line
+            const emailInLine = line.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+            const lineLower = line.toLowerCase();
+            const hasPendingText = PENDING_KEYWORDS.some(kw => lineLower.includes(kw));
+            const nextHasPendingText = PENDING_KEYWORDS.some(kw => nextLine.includes(kw));
+
+            if (emailInLine && (hasPendingText || nextHasPendingText)) {
+                const pendingEmail = emailInLine[1];
+                if (pendingEmail !== adminEmail) {
+                    familyMembers.push({ name: pendingEmail, email: pendingEmail, role: 'pending' });
+                    console.log(`[Scraper] ⏳ Pending invitation: ${pendingEmail}`);
+                    if (nextHasPendingText) i++; // skip the expiry line
+                    continue;
+                }
+            }
+            // Also check: invitation text on current line, email on previous line
+            if (hasPendingText && !emailInLine) {
+                const prevEmailMatch = (lines[i - 1] || '').match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+                if (prevEmailMatch && prevEmailMatch[1] !== adminEmail) {
+                    // Already handled by the check above when we were on the previous line
+                    continue;
+                }
+            }
+
+            // Exact match ONLY - "member" !== "membership"
+            const isMember = MEMBER_EXACT.some(role => nextLine === role);
+            const isManager = MANAGER_EXACT.some(role => nextLine === role);
+
+            if (!isMember && !isManager) continue;
+
+            // lineLower already defined above
+            const isBlacklisted = BLACKLIST.some(bl => lineLower.includes(bl));
+            if (isBlacklisted || line.length < 2 || line.length > 50 || line.includes('http') || line.includes('@')) {
+                console.log(`[Scraper] Skip invalid: "${line}"`);
+                continue;
+            }
+
+            if (isManager) {
+                console.log(`[Scraper] ✓ Manager: "${line}" (skip)`);
+            } else {
+                memberNames.push(line);
+                console.log(`[Scraper] ✓ Member: "${line}"`);
+            }
+        }
+
+        console.log(`[Scraper] Valid members: ${memberNames.length}, pending: ${familyMembers.filter(m => m.role === 'pending').length}`);
+
+        // Click each ACTIVE member to get email (skip pending - we already have their email)
+        for (const name of memberNames) {
+            try {
+                await driver.get(FAMILY_URL);
+                await smartSleep(driver, 3000);
+                let clicked = false;
+                try {
+                    const el = await driver.findElement(By.xpath(`//*[text()='${name}']`));
+                    try { const p = await el.findElement(By.xpath('./ancestor::a[1]')); await safeClick(driver, p); clicked = true; }
+                    catch { await safeClick(driver, el); clicked = true; }
+                } catch { }
+                if (!clicked) {
+                    try { const el = await driver.findElement(By.xpath(`//*[contains(text(), '${name}')]`)); await safeClick(driver, el); clicked = true; } catch { }
+                }
+                if (clicked) {
+                    await smartSleep(driver, 3000);
+                    const detail = await driver.findElement(By.css('body')).getText();
+                    const emails = detail.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g) || [];
+                    const email = emails.find(e => e !== adminEmail) || '';
+                    console.log(`[Scraper] ${name} → ${email}`);
+                    familyMembers.push({ name, email, role: 'member' });
+                } else {
+                    familyMembers.push({ name, email: '', role: 'member' });
+                }
+            } catch (err) {
+                familyMembers.push({ name, email: '', role: 'member' });
+            }
+        }
+    } catch (err) {
+        console.error('[Scraper] Family error:', err.message);
+    }
+
+    // Save to DB — ALWAYS sync real state (even if 0 members)
+    const COLORS = ['#f97316', '#06b6d4', '#8b5cf6', '#ef4444', '#22c55e', '#eab308', '#ec4899', '#14b8a6'];
+    const scrapedIdentifiers = familyMembers.map(m => m.name);
+
+    // Step 1: Remove members/pending no longer in Google Family
+    const existing = await db.prepare('SELECT id, name, status FROM members WHERE admin_id = ? AND status IN (?, ?)').all(adminId, 'active', 'pending');
+    for (const em of existing) {
+        if (!scrapedIdentifiers.includes(em.name)) {
+            await db.prepare('UPDATE members SET status = ? WHERE id = ?').run('removed', em.id);
+            console.log(`[Scraper] ✗ Removed (kicked/expired): "${em.name}"`);
+        }
+    }
+
+    // Step 2: Add/update members with correct status
+    for (const fm of familyMembers) {
+        const newStatus = fm.role === 'pending' ? 'pending' : 'active';
+        const ex = await db.prepare('SELECT id, status FROM members WHERE admin_id = ? AND name = ?').get(adminId, fm.name);
+        if (!ex) {
+            const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+            await db.prepare('INSERT INTO members (admin_id, name, email, avatar_color, status) VALUES (?, ?, ?, ?, ?)').run(adminId, fm.name, fm.email, color, newStatus);
+            console.log(`[Scraper] ✓ ${newStatus === 'pending' ? '⏳ Pending' : 'New member'}: ${fm.name} (${fm.email})`);
+        } else {
+            // Update email + status (pending→active if accepted, or keep current role)
+            await db.prepare("UPDATE members SET email = CASE WHEN ? != '' THEN ? ELSE email END, status = ? WHERE id = ?").run(fm.email, fm.email, newStatus, ex.id);
+            if (ex.status !== newStatus) console.log(`[Scraper] ↔ Status change: ${fm.name} ${ex.status} → ${newStatus}`);
+        }
+    }
+
+    console.log(`[Scraper] Sync complete: ${familyMembers.length} members, removed: ${existing.filter(e => !scrapedIdentifiers.includes(e.name)).length}`);
+
+    console.log(`[Scraper] Family result: ${familyMembers.length} members`);
+    return familyMembers;
+}
+
+async function scrapeStorage(driver) {
+    console.log('[Scraper] Navigating to storage page...');
+    await driver.get(STORAGE_URL);
+    await driver.sleep(8000); // FULL wait — storage page must render
+
+    let totalStorage = '30 TB', totalUsed = '0 GB';
+    let driveGB = 0, gmailGB = 0, photosGB = 0;
+    let familyStorage = [];
+
+    try {
+        // Scroll down to family storage section
+        await driver.executeScript('window.scrollTo(0, document.body.scrollHeight)');
+        await smartSleep(driver, 2000);
+
+        // Click ONLY the family storage text to expand (NOT aria-expanded which opens profile!)
+        try {
+            const familyEls = await driver.findElements(By.xpath(
+                '//*[contains(text(), "Bộ nhớ cho gia đình") or contains(text(), "Family storage")]'
+            ));
+            for (const el of familyEls) {
+                try {
+                    await driver.executeScript('arguments[0].scrollIntoView({block: "center"})', el);
+                    await smartSleep(driver, 500);
+                    await driver.executeScript('arguments[0].click()', el);
+                    await smartSleep(driver, 1000);
+                    // Try direct parent only (the row containing the text + chevron)
+                    await driver.executeScript('arguments[0].parentElement.click()', el);
+                    await smartSleep(driver, 1500);
+                } catch { }
+            }
+        } catch { }
+
+        await smartSleep(driver, 2000);
+        const pageText = await driver.findElement(By.css('body')).getText();
+        console.log('[Scraper] Storage page text (last 1000):', pageText.substring(Math.max(0, pageText.length - 1000)));
+
+        // Total storage - VN and EN
+        const totalMatch = pageText.match(/(\d+)\s*TB\s*bộ nhớ/i) || pageText.match(/(\d+)\s*TB.*?storage/i) || pageText.match(/(\d+)\s*TB/);
+        if (totalMatch) totalStorage = totalMatch[1] + ' TB';
+
+        // Used storage - VN and EN
+        const usedMatch = pageText.match(/Đã dùng\s*([\d,.]+)\s*(GB|MB|TB)/i) || pageText.match(/([\d,.]+)\s*(GB|MB|TB)\s*(?:of|out of)/i);
+        if (usedMatch) totalUsed = usedMatch[1] + ' ' + usedMatch[2];
+
+        const driveMatch = pageText.match(/Google Drive\s*([\d,.]+)\s*(GB|MB|TB)/i);
+        if (driveMatch) driveGB = parseStorageToGB(driveMatch[1], driveMatch[2]);
+
+        const gmailMatch = pageText.match(/Gmail\s*([\d,.]+)\s*(GB|MB|TB)/i);
+        if (gmailMatch) gmailGB = parseStorageToGB(gmailMatch[1], gmailMatch[2]);
+
+        const photosMatch = pageText.match(/Google Photos\s*([\d,.]+)\s*(GB|MB|TB)/i);
+        if (photosMatch) photosGB = parseStorageToGB(photosMatch[1], photosMatch[2]);
+
+        // Family storage section - VN and EN
+        const familySection = pageText.split('Bộ nhớ cho gia đình')[1] || pageText.split('Family storage')[1] || '';
+        if (familySection) {
+            const memberMatches = familySection.match(/([A-Za-zÀ-ỹ\s@.!]+?)\s*([\d,.]+)\s*(GB|MB|TB)/g);
+            if (memberMatches) {
+                for (const line of memberMatches) {
+                    const parts = line.match(/([A-Za-zÀ-ỹ\s@.!]+?)\s*([\d,.]+)\s*(GB|MB|TB)/);
+                    if (parts) {
+                        const name = parts[1].trim();
+                        if (name.length > 1 && !name.includes('Google') && !name.includes('thành viên')) {
+                            familyStorage.push({ name, gb: parseStorageToGB(parts[2], parts[3]) });
+                        }
+                    }
+                }
+            }
+        }
+    } catch (err) {
+        console.error('[Scraper] Storage error:', err.message);
+    }
+
+    console.log(`[Scraper] Storage: total=${totalStorage}, used=${totalUsed}, family=${JSON.stringify(familyStorage)}`);
+    return { totalStorage, totalUsed, driveGB, gmailGB, photosGB, familyStorage };
+}
+
+// ========= HELPERS =========
+
+function parseCreditsNumber(text) {
+    if (!text) return 0;
+    return parseInt(text.replace(/[^0-9.,]/g, '').replace(/\./g, '').replace(/,/g, '')) || 0;
+}
+
+function parseStorageToGB(value, unit) {
+    const num = parseFloat(value.replace(',', '.')) || 0;
+    switch (unit.toUpperCase()) {
+        case 'TB': return num * 1024;
+        case 'GB': return num;
+        case 'MB': return num / 1024;
+        default: return num;
+    }
+}
+
+async function saveData(adminId, creditData, storageData) {
+    const admin = await db.prepare('SELECT * FROM admins WHERE id = ?').get(adminId);
+    if (!admin) return;
+    const today = new Date().toISOString().split('T')[0];
+    const now = new Date().toISOString();
+
+    // ===== CREDITS: Store absolute value from Google =====
+    // creditData.monthlyCredits = credits remaining from Google One page
+    // Sanity check: value must be between 0 and total_monthly_credits
+    const maxCredits = admin.total_monthly_credits || 25000;
+    if (creditData.monthlyCredits > 0 && creditData.monthlyCredits <= maxCredits) {
+        await db.prepare('UPDATE admins SET credits_remaining_actual = ?, last_sync = ? WHERE id = ?')
+            .run(creditData.monthlyCredits, now, adminId);
+        console.log(`[Scraper] Credits OK: ${creditData.monthlyCredits}/${maxCredits}`);
+    } else {
+        // Don't overwrite — just update last_sync
+        console.log(`[Scraper] ⚠ Credits invalid (${creditData.monthlyCredits}/${maxCredits}) — skipping update`);
+        await db.prepare('UPDATE admins SET last_sync = ? WHERE id = ?').run(now, adminId);
+    }
+
+    // For member usage: only log if value changed
+    if (creditData.memberUsage.length > 0) {
+        for (const usage of creditData.memberUsage) {
+            const member = await db.prepare('SELECT id FROM members WHERE admin_id = ? AND name LIKE ?').get(adminId, `%${usage.name}%`);
+            if (!member) continue;
+
+            // Check last recorded value for this member
+            const lastLog = await db.prepare(
+                "SELECT amount FROM credit_logs WHERE member_id = ? AND admin_id = ? AND description LIKE '%[auto-sync]%' ORDER BY id DESC LIMIT 1"
+            ).get(member.id, adminId);
+
+            const lastAmount = lastLog ? lastLog.amount : 0;
+
+            // Only log if value changed
+            if (usage.amount !== lastAmount) {
+                await db.prepare('INSERT INTO credit_logs (admin_id, member_id, amount, description, log_date) VALUES (?, ?, ?, ?, ?)')
+                    .run(adminId, member.id, usage.amount, `[auto-sync] ${usage.name}`, today);
+                console.log(`[Scraper] Credit changed for ${usage.name}: ${lastAmount} -> ${usage.amount}`);
+            }
+        }
+    } else {
+        // Fallback: total usage from admin level
+        const creditsUsed = admin.total_monthly_credits - creditData.monthlyCredits;
+        if (creditsUsed > 0) {
+            const lastLog = await db.prepare(
+                "SELECT amount FROM credit_logs WHERE admin_id = ? AND member_id IS NULL AND description LIKE '%[auto-sync] Total%' ORDER BY id DESC LIMIT 1"
+            ).get(adminId);
+            const lastAmount = lastLog ? lastLog.amount : 0;
+
+            if (creditsUsed !== lastAmount) {
+                await db.prepare('INSERT INTO credit_logs (admin_id, member_id, amount, description, log_date) VALUES (?, NULL, ?, ?, ?)')
+                    .run(adminId, creditsUsed, '[auto-sync] Total usage', today);
+            }
+        }
+    }
+
+    // ===== STORAGE =====
+    if (storageData.familyStorage.length > 0) {
+        for (const s of storageData.familyStorage) {
+            const member = await db.prepare('SELECT id FROM members WHERE admin_id = ? AND name LIKE ?').get(adminId, `%${s.name}%`);
+            if (member) {
+                await db.prepare("DELETE FROM storage_logs WHERE member_id = ? AND admin_id = ? AND log_date = ?").run(member.id, adminId, today);
+                await db.prepare('INSERT INTO storage_logs (member_id, admin_id, drive_gb, gmail_gb, photos_gb, log_date) VALUES (?, ?, ?, ?, ?, ?)')
+                    .run(member.id, adminId, storageData.driveGB, storageData.gmailGB, storageData.photosGB, today);
+            }
+        }
+    }
+}
+
+// Global sync mutex — prevents syncAllAdmins + runSyncCycle from running simultaneously
+let globalSyncRunning = false;
+
+// ========= KILL ALL CHROME — force-kill mọi chrome/chromedriver sau mỗi sync cycle =========
+function killAllChrome() {
+    console.log('[Kill] 🔪 Force-killing ALL Chrome & ChromeDriver processes...');
+    try {
+        // Kill all chrome.exe processes
+        try { execSync('taskkill /F /IM chrome.exe /T', { stdio: 'ignore', timeout: 10000 }); } catch { }
+        // Kill all chromedriver.exe processes
+        try { execSync('taskkill /F /IM chromedriver.exe /T', { stdio: 'ignore', timeout: 10000 }); } catch { }
+        console.log('[Kill] ✅ All Chrome & ChromeDriver processes killed');
+    } catch (e) {
+        console.error('[Kill] Error:', e.message);
+    }
+    // Reset slot counters to 0 (since all browsers are dead)
+    activeBrowsers = 0;
+    activeVisible = 0;
+    browserQueue.length = 0;
+}
+
+// ========= FORCE KILL SINGLE DRIVER =========
+// Gracefully quit a single Selenium driver, with fallback force-kill
+async function forceKillDriver(driver) {
+    if (!driver) return;
+    try {
+        // Try graceful quit first
+        await Promise.race([
+            driver.quit(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('quit timeout')), 10000))
+        ]);
+        console.log('[ForceKill] ✓ Driver quit gracefully');
+    } catch (e) {
+        console.error('[ForceKill] driver.quit() failed:', e.message, '— killing via taskkill');
+        // Fallback: kill chromedriver (each driver spawns its own chromedriver)
+        try { execSync('taskkill /F /IM chromedriver.exe /T', { stdio: 'ignore', timeout: 5000 }); } catch { }
+    }
+}
+
+// ========= CONCURRENT POOL — launch farms 1-by-1, max 9 running at once =========
+// Farms chạy lần lượt từ đầu đến cuối, mỗi khi 1 farm xong thì farm tiếp theo bắt đầu ngay
+// Max 9 tổng (3 visible + 6 headless), slot system tự quản lý visible/headless
+
+async function processPool(admins, label) {
+    let ok = 0, fail = 0;
+    const running = new Set();
+
+    for (let i = 0; i < admins.length; i++) {
+        // If pool is full, wait for ANY one to finish before launching next
+        if (running.size >= MAX_TOTAL_BROWSERS) {
+            console.log(`[${label}] ⏳ Pool full (${running.size}/${MAX_TOTAL_BROWSERS}), waiting...`);
+            await Promise.race(running);
+        }
+
+        const admin = admins[i];
+        const tag = `[${i + 1}/${admins.length}]`;
+        console.log(`[${label}] ${tag} 🚀 Starting admin ${admin.id} (pool: ${running.size}/${MAX_TOTAL_BROWSERS})`);
+
+        // Launch farm (don't await — it runs in background)
+        const p = (async () => {
+            try {
+                await syncAdmin(admin.id);
+                ok++;
+                console.log(`[${label}] ${tag} Admin ${admin.id}: ✅`);
+            } catch (err) {
+                fail++;
+                console.error(`[${label}] ${tag} Admin ${admin.id}: ❌ ${err.message}`);
+            }
+        })();
+
+        running.add(p);
+        p.finally(() => running.delete(p));
+
+        // Small delay between launches to avoid thundering herd
+        await new Promise(r => setTimeout(r, 2000));
+    }
+
+    // Wait for remaining farms to finish
+    if (running.size > 0) {
+        console.log(`[${label}] ⏳ Waiting for ${running.size} remaining farms...`);
+        await Promise.allSettled(running);
+    }
+
+    return { ok, fail };
+}
+
+// Sync only farms belonging to a specific user
+async function syncUserAdmins(userId) {
+    if (globalSyncRunning) {
+        console.log('[Sync] ⏸ Another sync is already running, skipping');
+        return { ok: 0, fail: 0, total: 0, skipped: true };
+    }
+    globalSyncRunning = true;
+    try {
+        const admins = await db.prepare(`
+            SELECT id FROM admins 
+            WHERE status = 'active' AND google_password IS NOT NULL AND google_password != ''
+            AND user_id = ?
+            ORDER BY created_at DESC
+        `).all(userId);
+        console.log(`[Sync] User ${userId}: syncing ${admins.length} farms (pool max ${MAX_TOTAL_BROWSERS})`);
+
+        const { ok, fail } = await processPool(admins, 'Sync');
+        console.log(`[Sync] User ${userId} done! ${ok} OK, ${fail} errors / ${admins.length}`);
+
+        // Kill ALL Chrome sau khi sync xong toàn bộ
+        killAllChrome();
+
+        // Deep clean ALL profiles after sync cycle
+        try { deepCleanAllProfiles(); } catch (e) { console.log('[DeepClean] Error:', e.message); }
+
+        return { ok, fail, total: admins.length };
+    } finally {
+        globalSyncRunning = false;
+    }
+}
+
+// Legacy: sync ALL admins (used by auto-sync cycle only)
+async function syncAllAdmins() {
+    if (globalSyncRunning) {
+        console.log('[Sync] ⏸ Another sync is already running, skipping');
+        return { ok: 0, fail: 0, total: 0, skipped: true };
+    }
+    globalSyncRunning = true;
+    try {
+        const admins = await db.prepare(`
+            SELECT id, last_sync FROM admins 
+            WHERE status = 'active' AND google_password IS NOT NULL AND google_password != ''
+            ORDER BY created_at DESC
+        `).all();
+
+        // Skip farms synced < 10 minutes ago
+        const SKIP_THRESHOLD = 10 * 60 * 1000;
+        const toSync = admins.filter(a => {
+            if (a.last_sync && (Date.now() - new Date(a.last_sync).getTime()) < SKIP_THRESHOLD) {
+                console.log(`[Sync] Skip admin ${a.id} — synced ${Math.round((Date.now() - new Date(a.last_sync).getTime()) / 60000)}m ago`);
+                return false;
+            }
+            return true;
+        });
+
+        console.log(`[Sync] Server sync: ${toSync.length}/${admins.length} farms (pool max ${MAX_TOTAL_BROWSERS})`);
+
+        const { ok, fail } = await processPool(toSync, 'Sync');
+        console.log(`[Sync] All done! ${ok} OK, ${fail} errors / ${toSync.length}`);
+
+        // Kill ALL Chrome sau khi sync xong toàn bộ
+        killAllChrome();
+
+        // Deep clean ALL profiles after sync cycle — keep only login data
+        try { deepCleanAllProfiles(); } catch (e) { console.log('[DeepClean] Error:', e.message); }
+
+        // Next cycle in 15 minutes
+        if (syncCycleTimer) clearTimeout(syncCycleTimer);
+        const CYCLE_WAIT = 15 * 60 * 1000;
+        nextSyncTime = Date.now() + CYCLE_WAIT;
+        console.log(`[Sync] ⏰ Next auto-sync in 15 phút`);
+        syncCycleTimer = setTimeout(() => {
+            runSyncCycle().catch(e => console.error('[AutoSync] Cycle error:', e.message));
+        }, CYCLE_WAIT);
+
+        return { ok, fail, total: toSync.length };
+    } finally {
+        globalSyncRunning = false;
+    }
+}
+
+// ========= SEQUENTIAL ROUND-ROBIN AUTO SYNC =========
+// Syncs ALL admins: fire all → semaphore limits to 7 → wait → repeat
+let syncCycleTimer = null;
+let nextSyncTime = null; // Track when next auto-sync will start
+
+function parseSyncInterval(intervalText) {
+    if (!intervalText) return 30 * 60 * 1000;
+    const match = intervalText.match(/(\d+)/);
+    if (match) return parseInt(match[1]) * 60 * 1000;
+    if (intervalText.toLowerCase().includes('real')) return 5 * 60 * 1000;
+    return 30 * 60 * 1000;
+}
+
+async function runSyncCycle() {
+    if (globalSyncRunning) {
+        console.log('[AutoSync] Another sync running, skipping this cycle');
+        // Retry in 60s
+        syncCycleTimer = setTimeout(() => {
+            runSyncCycle().catch(e => console.error('[AutoSync] Cycle error:', e.message));
+        }, 60000);
+        return;
+    }
+    globalSyncRunning = true;
+
+    try {
+
+        const admins = await db.prepare(`
+            SELECT a.id, a.email, a.last_sync
+            FROM admins a
+            WHERE a.status = 'active' AND a.google_password IS NOT NULL AND a.google_password != ''
+            ORDER BY a.created_at DESC
+        `).all();
+
+        if (admins.length === 0) {
+            console.log('[AutoSync] No admins to sync');
+            return;
+        }
+
+        // Skip farms synced < 10 minutes ago
+        const SKIP_THRESHOLD = 10 * 60 * 1000;
+        const toSync = admins.filter(a => {
+            if (a.last_sync && (Date.now() - new Date(a.last_sync).getTime()) < SKIP_THRESHOLD) {
+                console.log(`[AutoSync] Skip admin ${a.id} — synced ${Math.round((Date.now() - new Date(a.last_sync).getTime()) / 60000)}m ago`);
+                return false;
+            }
+            return true;
+        });
+
+        console.log(`[AutoSync] ▶ Cycle: ${toSync.length}/${admins.length} farms (pool max ${MAX_TOTAL_BROWSERS})`);
+
+        const { ok, fail } = await processPool(toSync, 'AutoSync');
+
+        console.log(`[AutoSync] ✅ Cycle done! ${ok} OK, ${fail} errors / ${toSync.length}`);
+
+        // Kill ALL Chrome sau khi sync xong toàn bộ
+        killAllChrome();
+
+        // Deep clean ALL profiles after auto-sync cycle
+        try { deepCleanAllProfiles(); } catch (e) { console.log('[DeepClean] Error:', e.message); }
+
+        // Fixed 15 minutes wait after last farm finishes
+        const CYCLE_WAIT = 15 * 60 * 1000; // 15 phút
+        nextSyncTime = Date.now() + CYCLE_WAIT;
+        console.log(`[AutoSync] ⏰ Next cycle in 15 phút`);
+        syncCycleTimer = setTimeout(() => {
+            runSyncCycle().catch(e => console.error('[AutoSync] Cycle error:', e.message));
+        }, CYCLE_WAIT);
+
+    } catch (err) {
+        console.error('[AutoSync] Cycle error:', err.message);
+    } finally {
+        globalSyncRunning = false;
+    }
+}
+
+function startAutoSync() {
+    if (process.env.NODE_ENV !== 'production') {
+        console.log('[AutoSync] ⏸ Skipped (dev mode)');
+        return;
+    }
+    if (syncCycleTimer) clearTimeout(syncCycleTimer);
+    const FIRST_WAIT = 15 * 60 * 1000; // 15 phút sau khi server start
+    nextSyncTime = Date.now() + FIRST_WAIT;
+    console.log('[AutoSync] ▶ First sync in 15 phút');
+    syncCycleTimer = setTimeout(() => {
+        runSyncCycle().catch(e => console.error('[AutoSync] First cycle error:', e.message));
+    }, FIRST_WAIT);
+}
+
+// ========= ADD FAMILY MEMBER =========
+const FAMILY_URL = 'https://myaccount.google.com/family/details?utm_source=g1web&utm_medium=default';
+const INVITE_URL = 'https://myaccount.google.com/family/invitemembers?utm_source=g1web&utm_medium=default';
+
+async function addFamilyMember(adminId, memberEmail) {
+    const admin = await db.prepare('SELECT * FROM admins WHERE id = ?').get(adminId);
+    if (!admin) throw new Error('Admin not found');
+
+    let googlePassword = '';
+    if (admin.google_password) {
+        try { googlePassword = decrypt(admin.google_password) || ''; } catch { googlePassword = ''; }
+    }
+    if (!googlePassword) throw new Error('Admin chưa có Google password');
+
+    syncStatus[adminId] = { status: 'syncing', message: 'Đang mở browser để thêm thành viên...' };
+    let driver = null;
+    let slotAcquired = false;
+    let isHeadless = true;
+    let watchdog = null;
+
+    try {
+        driver = await createBrowser(adminId, admin.email);
+        slotAcquired = true;
+        isHeadless = driver._isHeadless;
+
+        // Watchdog: 3 minutes max for add member
+        watchdog = setTimeout(async () => {
+            console.log(`[AddMember] ⏰ Watchdog: admin ${adminId} exceeded 3 min, killing browser`);
+            syncStatus[adminId] = { status: 'error', message: '⏰ Thêm thành viên quá 3 phút — tự động dừng. Thử lại sau.' };
+            if (driver) { try { await forceKillDriver(driver); } catch (e) { try { await driver.quit(); } catch { } } driver = null; }
+        }, 3 * 60 * 1000);
+
+        // Go directly to family page — skip credits page
+        syncStatus[adminId].message = 'Đang mở trang gia đình...';
+        console.log(`[AddMember] Navigating directly to family page...`);
+        await driver.get(FAMILY_URL);
+        await smartSleep(driver, 5000);
+
+        let currentUrl = await driver.getCurrentUrl();
+
+        // If redirected to login page → need to login first
+        if (currentUrl.includes('accounts.google.com') || currentUrl.includes('/about')) {
+            console.log('[AddMember] Not logged in, performing login...');
+            syncStatus[adminId].message = 'Đang đăng nhập...';
+            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            // After login, go straight to family page
+            await driver.get(FAMILY_URL);
+            await smartSleep(driver, 5000);
+        } else {
+            console.log('[AddMember] ✓ Already logged in, on family page');
+        }
+
+        // Step 2: Click "+ Gửi lời mời"
+        syncStatus[adminId].message = 'Đang tìm nút "Gửi lời mời"...';
+        console.log(`[AddMember] Looking for invite button...`);
+
+        // Try clicking invite button directly on family page
+        let inviteBtn = await waitAndFind(driver, [
+            'a[href*="invitemembers"]',
+            'button[aria-label*="mời"]',
+            'a[aria-label*="mời"]'
+        ], 5000);
+
+        if (inviteBtn) {
+            await safeClick(driver, inviteBtn);
+            await smartSleep(driver, 3000);
+        } else {
+            // Fallback: navigate directly to invite URL
+            console.log('[AddMember] Invite button not found, navigating directly...');
+            await driver.get(INVITE_URL);
+            await smartSleep(driver, 3000);
+        }
+
+        // Step 3: Find email input and type member email
+        syncStatus[adminId].message = `Đang nhập email ${memberEmail}...`;
+        console.log(`[AddMember] Finding email input...`);
+
+        const emailInput = await waitAndFind(driver, [
+            'input[type="email"]',
+            'input[aria-label*="email"]',
+            'input[aria-label*="tên"]',
+            'input[placeholder*="email"]',
+            'input[placeholder*="tên"]'
+        ], 10000);
+
+        if (!emailInput) {
+            // Take screenshot for debugging
+            const pageText = await driver.findElement(By.css('body')).getText();
+            console.log('[AddMember] Page text:', pageText.substring(0, 500));
+            throw new Error('Không tìm thấy ô nhập email trên trang mời — Google có thể đang load chậm, thử lại sau');
+        }
+
+        await safeFill(driver, emailInput, memberEmail);
+        await smartSleep(driver, 2000);
+
+        // Sometimes need to select from autocomplete dropdown
+        try {
+            const suggestion = await waitAndFind(driver, [
+                `[data-email="${memberEmail}"]`,
+                '[role="option"]',
+                '[role="listbox"] [role="option"]'
+            ], 3000);
+            if (suggestion) {
+                await safeClick(driver, suggestion);
+                await smartSleep(driver, 1000);
+            }
+        } catch { /* no autocomplete, that's fine */ }
+
+        // Step 4: Click "Gửi" button — find by text content (most reliable)
+        syncStatus[adminId].message = 'Đang gửi lời mời...';
+        console.log(`[AddMember] Looking for Send button...`);
+
+        let clicked = false;
+        // Method 1: Find by exact text content
+        const buttons = await driver.findElements(By.css('button'));
+        for (const btn of buttons) {
+            try {
+                const text = (await btn.getText()).trim();
+                if (text === 'Gửi' || text === 'Send' || text === 'Gửi lời mời' || text === 'Send invitation') {
+                    await safeClick(driver, btn);
+                    clicked = true;
+                    console.log(`[AddMember] Clicked button with text: "${text}"`);
+                    break;
+                }
+            } catch { }
+        }
+
+        // Method 2: XPath fallback
+        if (!clicked) {
+            try {
+                const gửiBtn = await driver.findElement(By.xpath("//button[contains(text(), 'Gửi') or contains(text(), 'Send')]"));
+                await safeClick(driver, gửiBtn);
+                clicked = true;
+                console.log('[AddMember] Clicked via XPath');
+            } catch { }
+        }
+
+        // Method 3: data-idom selector
+        if (!clicked) {
+            const sendBtn = await waitAndFind(driver, [
+                'button[data-idom-class*="send"]'
+            ], 3000);
+            if (sendBtn) {
+                await safeClick(driver, sendBtn);
+                clicked = true;
+                console.log('[AddMember] Clicked via data-idom selector');
+            }
+        }
+
+        if (!clicked) throw new Error('Không tìm thấy nút Gửi trên trang mời');
+
+        await smartSleep(driver, 5000);
+
+        // Step 5: Check for success page + click "Tôi hiểu"
+        currentUrl = await driver.getCurrentUrl();
+        console.log(`[AddMember] After send URL: ${currentUrl}`);
+
+        const pageText = await driver.findElement(By.css('body')).getText();
+        if (pageText.includes('Đã gửi lời mời') || pageText.includes('Invitation sent') || currentUrl.includes('invitationcomplete')) {
+            console.log('[AddMember] ✓ Invitation sent successfully!');
+
+            // Click "Tôi hiểu" button
+            try {
+                const understandBtn = await driver.findElement(By.xpath(
+                    "//button[contains(text(), 'Tôi hiểu') or contains(text(), 'Got it') or contains(text(), 'I understand')]"
+                ));
+                await safeClick(driver, understandBtn);
+                await smartSleep(driver, 2000);
+            } catch {
+                console.log('[AddMember] "Tôi hiểu" button not found, but invitation was sent');
+            }
+
+            // Save member to DB with start/end dates
+            try {
+                const today = new Date();
+                const endDate = new Date(today);
+                endDate.setDate(endDate.getDate() + 30);
+                const startStr = today.toISOString().split('T')[0];
+                const endStr = endDate.toISOString().split('T')[0];
+                // Check if member already exists
+                const existing = await db.prepare("SELECT id FROM members WHERE admin_id = ? AND email = ? AND status IN ('active', 'pending')").get(adminId, memberEmail);
+                if (!existing) {
+                    await db.prepare("INSERT INTO members (admin_id, name, email, status, start_date, end_date) VALUES (?, ?, ?, 'pending', ?, ?)").run(adminId, memberEmail, memberEmail, startStr, endStr);
+                    console.log(`[AddMember] ✓ Member saved to DB: ${memberEmail} (${startStr} → ${endStr})`);
+                } else {
+                    // Update dates if not set
+                    await db.prepare("UPDATE members SET start_date = COALESCE(start_date, ?), end_date = COALESCE(end_date, ?) WHERE id = ?").run(startStr, endStr, existing.id);
+                    console.log(`[AddMember] ✓ Member dates updated: ${memberEmail}`);
+                }
+            } catch (dbErr) {
+                console.error('[AddMember] DB save error:', dbErr.message);
+            }
+
+            syncStatus[adminId] = { status: 'done', message: `✅ Đã gửi lời mời tới ${memberEmail}` };
+            return { success: true, message: `Đã gửi lời mời tới ${memberEmail}` };
+
+        } else if (pageText.includes('không hợp lệ') || pageText.includes('invalid')) {
+            throw new Error(`Email ${memberEmail} không hợp lệ`);
+        } else if (pageText.includes('đã là thành viên') || pageText.includes('already a member')) {
+            throw new Error(`${memberEmail} đã là thành viên rồi`);
+        } else {
+            console.log('[AddMember] Page text after send:', pageText.substring(0, 500));
+            throw new Error('Không xác định được kết quả gửi lời mời — kiểm tra thủ công trên Google Family');
+        }
+
+    } catch (err) {
+        console.error(`[AddMember] Error:`, err.message);
+        const friendlyMsg = classifyScraperError(err.message);
+        syncStatus[adminId] = { status: 'error', message: friendlyMsg };
+        throw new Error(friendlyMsg);
+    } finally {
+        if (watchdog) clearTimeout(watchdog);
+        if (driver) {
+            try { await forceKillDriver(driver); } catch (e) {
+                console.error('[AddMember] forceKillDriver failed:', e.message);
+                try { await driver.quit(); } catch { }
+            }
+        }
+        if (slotAcquired) releaseBrowserSlot(isHeadless);
+    }
+}
+
+// ========= CANCEL INVITATION =========
+async function cancelInvitation(adminId, memberEmail) {
+    const admin = await db.prepare('SELECT * FROM admins WHERE id = ?').get(adminId);
+    if (!admin) throw new Error('Admin not found');
+
+    let googlePassword = '';
+    if (admin.google_password) {
+        try { googlePassword = decrypt(admin.google_password) || ''; } catch { googlePassword = ''; }
+    }
+    if (!googlePassword) throw new Error('Admin chưa có Google password');
+
+    syncStatus[adminId] = { status: 'syncing', message: 'Đang mở browser để hủy lời mời...' };
+    let driver = null;
+    let slotAcquired = false;
+    let isHeadless = true;
+    let watchdog = null;
+
+    try {
+        driver = await createBrowser(adminId, admin.email);
+        slotAcquired = true;
+        isHeadless = driver._isHeadless;
+
+        // Watchdog: 3 minutes max
+        watchdog = setTimeout(async () => {
+            console.log(`[CancelInvite] ⏰ Watchdog: admin ${adminId} exceeded 3 min, killing browser`);
+            syncStatus[adminId] = { status: 'error', message: '⏰ Hủy lời mời quá 3 phút — tự động dừng. Thử lại sau.' };
+            if (driver) { try { await forceKillDriver(driver); } catch (e) { try { await driver.quit(); } catch { } } driver = null; }
+        }, 3 * 60 * 1000);
+
+        // Go directly to family page
+        syncStatus[adminId].message = 'Đang mở trang gia đình...';
+        console.log(`[CancelInvite] Navigating to family page...`);
+        await driver.get(FAMILY_URL);
+        await smartSleep(driver, 3000);
+
+        let currentUrl = await driver.getCurrentUrl();
+
+        // If not logged in → login first
+        if (currentUrl.includes('accounts.google.com') || currentUrl.includes('/about')) {
+            console.log('[CancelInvite] Not logged in, performing login...');
+            syncStatus[adminId].message = 'Đang đăng nhập...';
+            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            await driver.get(FAMILY_URL);
+            await smartSleep(driver, 3000);
+        } else {
+            console.log('[CancelInvite] ✓ Already logged in');
+        }
+
+        // Step 1: Click on the pending member email
+        syncStatus[adminId].message = `Đang tìm ${memberEmail}...`;
+        console.log(`[CancelInvite] Looking for: ${memberEmail}`);
+
+        let clicked = false;
+        try {
+            const el = await driver.findElement(By.xpath(`//*[contains(text(), '${memberEmail}')]`));
+            try {
+                const parent = await el.findElement(By.xpath('./ancestor::a[1]'));
+                await safeClick(driver, parent);
+                clicked = true;
+            } catch {
+                await safeClick(driver, el);
+                clicked = true;
+            }
+        } catch { }
+
+        if (!clicked) {
+            throw new Error(`Không tìm thấy ${memberEmail} trên trang gia đình`);
+        }
+
+        await smartSleep(driver, 2000);
+        console.log(`[CancelInvite] ✓ On member detail page`);
+
+        // Step 2: Click "Hủy lời mời" / "Cancel invitation"
+        syncStatus[adminId].message = 'Đang hủy lời mời...';
+
+        let cancelBtn = null;
+        // Try XPath first (any element)
+        const cancelXpaths = [
+            '//*[contains(text(), "Hủy lời mời")]',
+            '//*[contains(text(), "Huỷ lời mời")]',
+            '//*[contains(text(), "Cancel invitation")]'
+        ];
+        for (const xp of cancelXpaths) {
+            try {
+                cancelBtn = await driver.findElement(By.xpath(xp));
+                if (await cancelBtn.isDisplayed()) { console.log(`[CancelInvite] Found via XPath: ${xp}`); break; }
+                cancelBtn = null;
+            } catch { cancelBtn = null; }
+        }
+
+        // JS fallback
+        if (!cancelBtn) {
+            console.log('[CancelInvite] XPath failed, trying JS...');
+            cancelBtn = await driver.executeScript(`
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    if (el.children.length > 2) continue;
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    if (t === 'hủy lời mời' || t === 'huỷ lời mời' || t === 'cancel invitation') return el;
+                }
+                return null;
+            `);
+        }
+
+        if (!cancelBtn) {
+            const pageText = await driver.findElement(By.css('body')).getText();
+            console.log('[CancelInvite] Page text:', pageText.substring(0, 500));
+            throw new Error('Không tìm thấy nút "Hủy lời mời" / "Cancel invitation"');
+        }
+
+        await safeClick(driver, cancelBtn);
+        await smartSleep(driver, 2000);
+        console.log('[CancelInvite] ✓ Clicked cancel');
+
+        // Step 3: Confirm "Có" / "Yes"
+        syncStatus[adminId].message = 'Đang xác nhận...';
+
+        let confirmBtn = null;
+        const confirmXpaths = [
+            '//button[text()="Có"]', '//button[text()="Yes"]',
+            '//*[text()="Có"]', '//*[text()="Yes"]'
+        ];
+        for (const xp of confirmXpaths) {
+            try {
+                confirmBtn = await driver.findElement(By.xpath(xp));
+                if (await confirmBtn.isDisplayed()) { console.log(`[CancelInvite] Confirm found: ${xp}`); break; }
+                confirmBtn = null;
+            } catch { confirmBtn = null; }
+        }
+
+        // JS fallback
+        if (!confirmBtn) {
+            confirmBtn = await driver.executeScript(`
+                const all = document.querySelectorAll('button, a, span, [role="button"]');
+                for (const el of all) {
+                    const t = (el.textContent || '').trim();
+                    if (t === 'Có' || t === 'Yes') return el;
+                }
+                return null;
+            `);
+        }
+
+        if (!confirmBtn) throw new Error('Không tìm thấy nút xác nhận');
+
+        await safeClick(driver, confirmBtn);
+        await smartSleep(driver, 3000);
+        console.log('[CancelInvite] ✓ Confirmed');
+
+        // Step 4: Check we're back on the family details page (no more pending member)
+        currentUrl = await driver.getCurrentUrl();
+        console.log(`[CancelInvite] After cancel URL: ${currentUrl}`);
+
+        if (currentUrl.includes('family/details') || currentUrl.includes('family')) {
+            console.log('[CancelInvite] ✓ Back on family page — invitation cancelled!');
+        }
+
+        // Update DB: mark member as removed
+        await db.prepare("UPDATE members SET status = 'removed' WHERE admin_id = ? AND email = ? AND status = 'pending'").run(adminId, memberEmail);
+        console.log(`[CancelInvite] ✓ DB updated: ${memberEmail} -> removed`);
+
+        syncStatus[adminId] = { status: 'done', message: `✅ Đã hủy lời mời ${memberEmail}` };
+        return { success: true, message: `Đã hủy lời mời ${memberEmail}` };
+
+    } catch (err) {
+        console.error(`[CancelInvite] Error:`, err.message);
+        const friendlyMsg = classifyScraperError(err.message);
+        syncStatus[adminId] = { status: 'error', message: friendlyMsg };
+        throw new Error(friendlyMsg);
+    } finally {
+        if (watchdog) clearTimeout(watchdog);
+        if (driver) {
+            try { await forceKillDriver(driver); } catch (e) {
+                console.error('[CancelInvite] forceKillDriver failed:', e.message);
+                try { await driver.quit(); } catch { }
+            }
+        }
+        if (slotAcquired) releaseBrowserSlot(isHeadless);
+    }
+}
+
+// ========= REMOVE FAMILY MEMBER =========
+async function removeFamilyMember(adminId, memberId) {
+    const admin = await db.prepare('SELECT * FROM admins WHERE id = ?').get(adminId);
+    if (!admin) throw new Error('Admin not found');
+
+    const member = await db.prepare('SELECT * FROM members WHERE id = ? AND admin_id = ?').get(memberId, adminId);
+    if (!member) throw new Error('Member not found');
+
+    let googlePassword = '';
+    if (admin.google_password) {
+        try { googlePassword = decrypt(admin.google_password) || ''; } catch { googlePassword = ''; }
+    }
+    if (!googlePassword) throw new Error('Admin chưa có Google password');
+
+    syncStatus[adminId] = { status: 'syncing', message: `Đang xóa ${member.name}...` };
+    let driver = null;
+    let slotAcquired = false;
+    let isHeadless = true;
+    let watchdog = null;
+
+    try {
+        driver = await createBrowser(adminId, admin.email);
+        slotAcquired = true;
+        isHeadless = driver._isHeadless;
+
+        // Watchdog: 3 minutes max
+        watchdog = setTimeout(async () => {
+            console.log(`[RemoveMember] ⏰ Watchdog: admin ${adminId} exceeded 3 min, killing browser`);
+            syncStatus[adminId] = { status: 'error', message: '⏰ Xóa thành viên quá 3 phút — tự động dừng. Thử lại sau.' };
+            if (driver) { try { await forceKillDriver(driver); } catch (e) { try { await driver.quit(); } catch { } } driver = null; }
+        }, 3 * 60 * 1000);
+
+        // Go directly to family page
+        syncStatus[adminId].message = 'Đang mở trang gia đình...';
+        console.log(`[RemoveMember] Navigating to family page...`);
+        await driver.get(FAMILY_URL);
+        await smartSleep(driver, 3000);
+
+        let currentUrl = await driver.getCurrentUrl();
+
+        // If not logged in → login first
+        if (currentUrl.includes('accounts.google.com') || currentUrl.includes('/about')) {
+            console.log('[RemoveMember] Not logged in, performing login...');
+            syncStatus[adminId].message = 'Đang đăng nhập...';
+            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            await driver.get(FAMILY_URL);
+            await smartSleep(driver, 3000);
+        } else {
+            console.log('[RemoveMember] ✓ Already logged in');
+        }
+
+        // Step 1: Click on the member
+        syncStatus[adminId].message = `Đang tìm ${member.name}...`;
+        const memberName = member.name;
+        const memberEmail = member.email;
+        console.log(`[RemoveMember] Looking for: ${memberName} (${memberEmail})`);
+
+        let clicked = false;
+        // Try by name first, then by email
+        for (const searchText of [memberName, memberEmail]) {
+            if (!searchText || clicked) continue;
+            try {
+                const el = await driver.findElement(By.xpath(`//*[contains(text(), '${searchText}')]`));
+                try {
+                    const parent = await el.findElement(By.xpath('./ancestor::a[1]'));
+                    await safeClick(driver, parent);
+                    clicked = true;
+                } catch {
+                    await safeClick(driver, el);
+                    clicked = true;
+                }
+            } catch { }
+        }
+
+        if (!clicked) {
+            throw new Error(`Không tìm thấy ${memberName} trên trang gia đình`);
+        }
+
+        await smartSleep(driver, 2000);
+        console.log(`[RemoveMember] ✓ On member detail page`);
+
+        // Step 2: Click "Xóa thành viên" / "Remove member"
+        syncStatus[adminId].message = 'Đang bấm xóa thành viên...';
+
+        let removeBtn = null;
+        const removeXpaths = [
+            '//*[contains(text(), "Xóa thành viên")]',
+            '//*[contains(text(), "Xoá thành viên")]',
+            '//*[contains(text(), "Remove member")]',
+            '//*[contains(text(), "remove member")]'
+        ];
+        for (const xp of removeXpaths) {
+            try {
+                removeBtn = await driver.findElement(By.xpath(xp));
+                if (await removeBtn.isDisplayed()) { console.log(`[RemoveMember] Found: ${xp}`); break; }
+                removeBtn = null;
+            } catch { removeBtn = null; }
+        }
+
+        // JS fallback
+        if (!removeBtn) {
+            removeBtn = await driver.executeScript(`
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    if (el.children.length > 2) continue;
+                    const t = (el.textContent || '').trim().toLowerCase();
+                    if (t === 'xóa thành viên' || t === 'xoá thành viên' || t === 'remove member') return el;
+                }
+                return null;
+            `);
+        }
+
+        if (!removeBtn) {
+            throw new Error('Không tìm thấy nút "Xóa thành viên"');
+        }
+
+        await safeClick(driver, removeBtn);
+        await smartSleep(driver, 3000);
+        console.log('[RemoveMember] ✓ Clicked remove button');
+
+        // Step 3: Handle verification challenges after clicking remove
+        currentUrl = await driver.getCurrentUrl();
+        let pageText = await driver.findElement(By.css('body')).getText();
+        console.log(`[RemoveMember] After click URL: ${currentUrl}`);
+        console.log(`[RemoveMember] Page text (300): ${pageText.substring(0, 300)}`);
+
+        // Case A: Password re-verification → enter password
+        if (currentUrl.includes('challenge/pwd') || currentUrl.includes('challenge/password') ||
+            pageText.includes('Enter your password') || pageText.includes('Nhập mật khẩu') ||
+            pageText.includes('verify it') || pageText.includes('xác minh danh tính')) {
+
+            console.log('[RemoveMember] Password re-verification required...');
+            syncStatus[adminId].message = 'Đang nhập lại mật khẩu...';
+
+            let passInput = null;
+            try { passInput = await driver.findElement(By.css('input[type="password"]')); } catch { }
+            if (!passInput) { try { passInput = await driver.findElement(By.css('input[name="Passwd"]')); } catch { } }
+
+            if (passInput) {
+                await safeFill(driver, passInput, googlePassword);
+                console.log('[RemoveMember] ✓ Entered password');
+
+                // Click Next
+                let nextBtn = null;
+                for (const xp of ['//button[contains(text(), "Next")]', '//button[contains(text(), "Tiếp")]', '//button[contains(text(), "Sign in")]', '//button[contains(text(), "Đăng nhập")]', '#passwordNext']) {
+                    try {
+                        nextBtn = xp.startsWith('//') ? await driver.findElement(By.xpath(xp)) : await driver.findElement(By.css(xp));
+                        break;
+                    } catch { }
+                }
+                if (nextBtn) await safeClick(driver, nextBtn);
+                await smartSleep(driver, 3000);
+                console.log('[RemoveMember] ✓ Password submitted');
+
+                // Re-read page for next step
+                currentUrl = await driver.getCurrentUrl();
+                pageText = await driver.findElement(By.css('body')).getText();
+                console.log(`[RemoveMember] After password URL: ${currentUrl}`);
+            } else {
+                throw new Error('Không tìm thấy ô nhập mật khẩu');
+            }
+        }
+
+        // Case B: Phone verification required → abort
+        if (pageText.includes('số điện thoại') || pageText.includes('phone number') ||
+            pageText.includes('Dùng một số điện thoại') || pageText.includes('Use your phone') ||
+            currentUrl.includes('challenge/selection')) {
+            console.log('[RemoveMember] ⚠ Phone verification required — aborting');
+            syncStatus[adminId] = { status: 'error', message: `⚠ Account cần xác minh SĐT. Vui lòng xóa ${memberName} thủ công.` };
+            return { success: false, needsManual: true, message: `Account cần xác minh số điện thoại. Vui lòng xóa "${memberName}" thủ công trên Google Family.` };
+        }
+
+        // Case C: 2FA/TOTP required → enter code
+        if (currentUrl.includes('challenge/totp') ||
+            pageText.includes('Authenticator') || pageText.includes('authenticator') ||
+            pageText.includes('Nhập mã') || pageText.includes('Enter code') ||
+            pageText.includes('mã xác minh')) {
+
+            if (admin.totp_secret) {
+                console.log('[RemoveMember] 2FA required, entering TOTP...');
+                syncStatus[adminId].message = 'Đang nhập mã 2FA...';
+
+                // Find TOTP input
+                let totpInput = null;
+                try { totpInput = await driver.findElement(By.css('input[type="tel"]')); } catch { }
+                if (!totpInput) { try { totpInput = await driver.findElement(By.css('input[type="text"]')); } catch { } }
+                if (!totpInput) { try { totpInput = await driver.findElement(By.css('#totpPin')); } catch { } }
+
+                if (totpInput) {
+                    const OTPAuth = require('otpauth');
+                    const totp = new OTPAuth.TOTP({ secret: OTPAuth.Secret.fromBase32(admin.totp_secret.replace(/\s/g, '')), digits: 6, period: 30 });
+                    const code = totp.generate();
+                    await safeFill(driver, totpInput, code);
+                    console.log(`[RemoveMember] Entered TOTP: ${code}`);
+
+                    // Click Next/Verify — try multiple methods
+                    let verifyBtn = null;
+                    for (const xp of ['//button[contains(text(), "Tiếp")]', '//button[contains(text(), "Next")]', '//button[contains(text(), "Xác minh")]', '//button[contains(text(), "Verify")]']) {
+                        try { verifyBtn = await driver.findElement(By.xpath(xp)); break; } catch { }
+                    }
+                    // JS fallback for Next button
+                    if (!verifyBtn) {
+                        verifyBtn = await driver.executeScript(`
+                            const all = document.querySelectorAll('button, [role="button"]');
+                            for (const el of all) {
+                                const t = (el.textContent || '').trim();
+                                if (t === 'Next' || t === 'Tiếp theo' || t === 'Verify' || t === 'Xác minh') return el;
+                            }
+                            return null;
+                        `);
+                    }
+                    if (verifyBtn) {
+                        await safeClick(driver, verifyBtn);
+                        console.log('[RemoveMember] ✓ Clicked Next/Verify');
+                    } else {
+                        console.log('[RemoveMember] ⚠ Next button not found, trying Enter key...');
+                        await totpInput.sendKeys(require('selenium-webdriver').Key.RETURN);
+                    }
+
+                    // Wait for 2FA page to go away (poll up to 15s)
+                    console.log('[RemoveMember] Waiting for 2FA to process...');
+                    for (let i = 0; i < 8; i++) {
+                        await smartSleep(driver, 2000);
+                        currentUrl = await driver.getCurrentUrl();
+                        console.log(`[RemoveMember] 2FA poll ${i + 1}: ${currentUrl.substring(0, 80)}`);
+                        if (!currentUrl.includes('challenge/totp')) {
+                            console.log('[RemoveMember] ✓ 2FA passed!');
+                            break;
+                        }
+                    }
+                } else {
+                    throw new Error('Không tìm thấy ô nhập mã 2FA');
+                }
+            } else {
+                syncStatus[adminId] = { status: 'error', message: `⚠ Account yêu cầu 2FA nhưng chưa có TOTP. Xóa ${memberName} thủ công.` };
+                return { success: false, needsManual: true, message: `Account yêu cầu 2FA nhưng chưa cấu hình TOTP. Vui lòng xóa "${memberName}" thủ công.` };
+            }
+        }
+
+        // Wait for confirmation page (poll up to 20s)
+        console.log('[RemoveMember] Waiting for confirmation page...');
+        syncStatus[adminId].message = 'Đang chờ trang xác nhận...';
+
+        let confirmPageText = '';
+        let onConfirmPage = false;
+        let alreadyOnFamilyPage = false;
+
+        for (let i = 0; i < 10; i++) {
+            await smartSleep(driver, 2000);
+            currentUrl = await driver.getCurrentUrl();
+            confirmPageText = await driver.findElement(By.css('body')).getText();
+            const lowerText = confirmPageText.toLowerCase();
+            console.log(`[RemoveMember] Confirm poll ${i + 1}: URL=${currentUrl.substring(0, 100)}`);
+
+            // Already back on family page → member was removed without confirmation
+            if (currentUrl.includes('family/details')) {
+                console.log('[RemoveMember] ✓ Already back on family page');
+                alreadyOnFamilyPage = true;
+                break;
+            }
+
+            // On confirmation URL
+            if (currentUrl.includes('family/remove') || currentUrl.includes('family%2Fremove')) {
+                console.log('[RemoveMember] ✓ On removal page (URL)');
+                onConfirmPage = true;
+                break;
+            }
+
+            // On confirmation page (text)
+            if (lowerText.includes('thành viên gia đình') || lowerText.includes('remove family member') ||
+                lowerText.includes('mất quyền truy cập') || lowerText.includes('will lose access')) {
+                console.log('[RemoveMember] ✓ On removal page (text)');
+                onConfirmPage = true;
+                break;
+            }
+
+            // Still on challenge → keep waiting
+            if (currentUrl.includes('challenge/')) {
+                console.log('[RemoveMember] Still on challenge, waiting...');
+                continue;
+            }
+
+            // Other page → try to find Remove button
+            console.log('[RemoveMember] Unknown page, checking for button...');
+            onConfirmPage = true;
+            break;
+        }
+
+        // Click "Xóa" / "Remove" on confirmation page
+        let removalConfirmed = false;
+
+        if (alreadyOnFamilyPage) {
+            removalConfirmed = true;
+            console.log('[RemoveMember] Member already removed (no confirmation needed)');
+        } else if (onConfirmPage) {
+            console.log('[RemoveMember] Looking for Remove button...');
+            syncStatus[adminId].message = 'Đang xác nhận xóa...';
+
+            let confirmRemoveBtn = null;
+
+            // JS first — most reliable
+            confirmRemoveBtn = await driver.executeScript(`
+                const all = document.querySelectorAll('button, a, span, [role="button"]');
+                for (const el of all) {
+                    const t = (el.textContent || '').trim();
+                    if (t === 'Xóa' || t === 'Xoá' || t === 'Remove' || t === 'Xoả') return el;
+                }
+                return null;
+            `);
+
+            // XPath fallback
+            if (!confirmRemoveBtn) {
+                for (const xp of [
+                    '//button[text()="Xóa"]', '//button[text()="Xoá"]', '//button[text()="Remove"]',
+                    '//*[text()="Xóa"]', '//*[text()="Xoá"]', '//*[text()="Remove"]'
+                ]) {
+                    try {
+                        confirmRemoveBtn = await driver.findElement(By.xpath(xp));
+                        if (await confirmRemoveBtn.isDisplayed()) break;
+                        confirmRemoveBtn = null;
+                    } catch { confirmRemoveBtn = null; }
+                }
+            }
+
+            if (confirmRemoveBtn) {
+                await safeClick(driver, confirmRemoveBtn);
+                await smartSleep(driver, 3000);
+                console.log('[RemoveMember] ✓ Clicked Remove — confirmed!');
+                removalConfirmed = true;
+            } else {
+                console.log('[RemoveMember] ⚠ Remove button not found, page:', confirmPageText.substring(0, 300));
+            }
+        } else {
+            console.log('[RemoveMember] ⚠ Could not reach confirmation page');
+        }
+
+        // Only update DB if removal was actually confirmed
+        if (removalConfirmed) {
+            await db.prepare("UPDATE members SET status = 'removed' WHERE id = ?").run(memberId);
+            console.log(`[RemoveMember] ✓ DB updated: ${memberName} -> removed`);
+            syncStatus[adminId] = { status: 'done', message: `✅ Đã xóa ${memberName} khỏi nhóm gia đình` };
+            return { success: true, message: `Đã xóa ${memberName} khỏi nhóm gia đình` };
+        } else {
+            syncStatus[adminId] = { status: 'error', message: `⚠ Không thể xóa ${memberName}. Vui lòng thử lại hoặc xóa thủ công.` };
+            return { success: false, message: `Không thể xóa "${memberName}". Vui lòng thử lại hoặc xóa thủ công.` };
+        }
+
+    } catch (err) {
+        console.error(`[RemoveMember] Error:`, err.message);
+        const friendlyMsg = classifyScraperError(err.message);
+        syncStatus[adminId] = { status: 'error', message: friendlyMsg };
+        throw new Error(friendlyMsg);
+    } finally {
+        if (watchdog) clearTimeout(watchdog);
+        if (driver) {
+            try { await forceKillDriver(driver); } catch (e) {
+                console.error('[RemoveMember] forceKillDriver failed:', e.message);
+                try { await driver.quit(); } catch { }
+            }
+        }
+        if (slotAcquired) releaseBrowserSlot(isHeadless);
+    }
+}
+
+function getNextSyncTime() {
+    if (globalSyncRunning) return { status: 'syncing', nextSync: null };
+    return { status: 'waiting', nextSync: nextSyncTime };
+}
+
+module.exports = { syncAdmin, syncAllAdmins, syncUserAdmins, getSyncStatus, startAutoSync, addFamilyMember, cancelInvitation, removeFamilyMember, getNextSyncTime, deepCleanAllProfiles };

@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Database files
+*.db
+data/
+
+# Browser profiles (Chrome sessions — must stay local)
+browser_data/
+
+# Environment
+.env
+
+# Bot folder (separate deployment on VPS)
+MY_BOT/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
