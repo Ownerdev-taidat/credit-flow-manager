@@ -143,10 +143,24 @@ const App = {
     async api(url, method = 'GET', body = null) {
         const opts = { method, headers: { 'Content-Type': 'application/json' } };
         if (body) opts.body = JSON.stringify(body);
-        const res = await fetch(url, opts);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Something went wrong');
-        return data;
+        const maxRetries = method === 'GET' ? 2 : 0; // Only retry GET requests
+        let lastError;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                const res = await fetch(url, opts);
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Something went wrong');
+                return data;
+            } catch (err) {
+                lastError = err;
+                if (attempt < maxRetries && (err.message === 'Failed to fetch' || err.name === 'TypeError')) {
+                    await new Promise(r => setTimeout(r, 1000)); // Wait 1s before retry
+                    continue;
+                }
+                throw err;
+            }
+        }
+        throw lastError;
     },
 
     openModal(title, bodyHtml) {
