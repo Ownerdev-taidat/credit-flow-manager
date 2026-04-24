@@ -5,16 +5,59 @@ const { requireAuth } = require('./auth');
 const OTPAuth = require('otpauth');
 const { encrypt, decrypt } = require('../services/crypto');
 
-// Scraper is optional (requires Playwright)
-// If not available, forward sync requests to VPS via API bridge
+// Scraper is optional (requires Chrome + ChromeDriver)
+// On Railway/production (no Chrome), forward ALL requests to VPS via API bridge
 let syncAdmin, syncAllAdmins, syncUserAdmins, getSyncStatus, addFamilyMember, cancelInvitation, removeFamilyMember, getNextSyncTime;
 let useVpsBridge = false;
-try {
-  ({ syncAdmin, syncAllAdmins, syncUserAdmins, getSyncStatus, addFamilyMember, cancelInvitation, removeFamilyMember, getNextSyncTime } = require('../services/scraper'));
-} catch {
+
+// Detect Chrome availability — Railway doesn't have Chrome binary
+function isChromeAvailable() {
+  const { execSync } = require('child_process');
+  const fs = require('fs');
+  // Check common Chrome paths
+  const chromePaths = [
+    process.env.CHROME_BIN,
+    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/chromium',
+  ].filter(Boolean);
+  for (const p of chromePaths) {
+    if (fs.existsSync(p)) return true;
+  }
+  // Try `which` on Linux
+  try {
+    execSync('which google-chrome || which chromium-browser || which chromium', { stdio: 'ignore' });
+    return true;
+  } catch { }
+  // Try `where` on Windows
+  try {
+    execSync('where chrome', { stdio: 'ignore' });
+    return true;
+  } catch { }
+  return false;
+}
+
+const chromeFound = isChromeAvailable();
+if (chromeFound) {
+  try {
+    ({ syncAdmin, syncAllAdmins, syncUserAdmins, getSyncStatus, addFamilyMember, cancelInvitation, removeFamilyMember, getNextSyncTime } = require('../services/scraper'));
+    console.log('[Admins] ✅ Chrome detected — using LOCAL scraper');
+  } catch (e) {
+    console.log('[Admins] ⚠ Scraper import failed:', e.message, '— falling back to VPS bridge');
+    useVpsBridge = true;
+  }
+} else {
   useVpsBridge = true;
+  console.log('[Admins] ⚠ Chrome NOT found — using VPS bridge for all scraper operations');
+}
+
+if (useVpsBridge) {
   const SYNC_KEY = process.env.SYNC_API_KEY || 'sync-bridge-2026';
   const VPS_URL = process.env.VPS_SYNC_URL || 'http://147.124.205.237:3000';
+  console.log(`[Admins] VPS Bridge → ${VPS_URL}`);
 
   syncAdmin = async (adminId) => {
     try {
@@ -41,7 +84,7 @@ try {
       return { status: 'error', message: 'Không kết nối được VPS sync server' };
     }
   };
-  syncUserAdmins = syncAllAdmins; // same bridge for user-scoped sync
+  syncUserAdmins = syncAllAdmins;
 
   getSyncStatus = async (adminId) => {
     try {
@@ -63,7 +106,7 @@ try {
       });
       return await res.json();
     } catch (err) {
-      return { status: 'error', message: 'Không kết nối được VPS' };
+      return { status: 'error', message: 'Không kết nối được VPS — vui lòng kiểm tra VPS đang chạy' };
     }
   };
 

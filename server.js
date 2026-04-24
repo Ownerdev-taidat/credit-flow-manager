@@ -71,12 +71,26 @@ db.init().then(() => {
     app.listen(PORT, () => {
         console.log(`🚀 Credit-Flow Manager running on http://localhost:${PORT}`);
 
-        // Start auto sync (optional - requires Playwright)
-        try {
-            const { startAutoSync } = require('./services/scraper');
-            startAutoSync();
-        } catch (err) {
-            console.log('[Scraper] ⚠️ Không khả dụng - bỏ qua auto sync');
+        // Start auto sync (requires Chrome — only on VPS, skip on Railway)
+        const hasChromeForSync = (() => {
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            const paths = [process.env.CHROME_BIN, 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium-browser', '/usr/bin/chromium'].filter(Boolean);
+            for (const p of paths) { if (fs.existsSync(p)) return true; }
+            try { execSync('which google-chrome || which chromium-browser || which chromium', { stdio: 'ignore' }); return true; } catch { }
+            try { execSync('where chrome', { stdio: 'ignore' }); return true; } catch { }
+            return false;
+        })();
+        if (hasChromeForSync) {
+            try {
+                const { startAutoSync } = require('./services/scraper');
+                startAutoSync();
+                console.log('[Scraper] ✅ Chrome found — auto-sync enabled');
+            } catch (err) {
+                console.log('[Scraper] ⚠️ Scraper load failed:', err.message);
+            }
+        } else {
+            console.log('[Scraper] ⏭ Chrome not found (Railway) — auto-sync disabled, using VPS bridge');
         }
 
         // Start MB Bank service

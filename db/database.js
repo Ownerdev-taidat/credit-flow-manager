@@ -396,6 +396,62 @@ async function seedData() {
     }
     console.log('[DB] Seeded default config');
   }
+
+  // Auto-seed MBBank config from config.json OR environment variables if not yet in DB
+  const mbCheck = await db.prepare("SELECT value FROM sa_config WHERE key = 'mb_api_key'").get();
+  if (!mbCheck || !mbCheck.value) {
+    let mbConfigs = [];
+    try {
+      // Try 1: Read from config.json (local/VPS)
+      const fs = require('fs');
+      const cfgPath = path.join(__dirname, '..', 'config.json');
+      if (fs.existsSync(cfgPath)) {
+        const cfgData = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+        mbConfigs = [
+          { key: 'mb_api_key', value: cfgData.apicanhanKey || '' },
+          { key: 'mb_account_no', value: cfgData.apicanhanAccount || cfgData.accountNo || '' },
+          { key: 'mb_user', value: cfgData.apicanhanUser || cfgData.user || '' },
+          { key: 'mb_password', value: cfgData.apicanhanPass || '' },
+          { key: 'mb_bot_token', value: cfgData.botToken || '' },
+          { key: 'mb_chat_id', value: cfgData.chat_id || '' },
+          { key: 'mb_session_id', value: cfgData.sessionId || '' },
+          { key: 'mb_token', value: cfgData.token || '' },
+          { key: 'mb_cookie', value: cfgData.cookie || '' },
+          { key: 'mb_device_id', value: cfgData.deviceid || '' },
+          { key: 'mb_id_run', value: cfgData.id_run || '' },
+        ].filter(c => c.value);
+        if (mbConfigs.length > 0) console.log('[DB] Found MBBank config in config.json');
+      }
+    } catch (e) {
+      console.log('[DB] config.json read error:', e.message);
+    }
+
+    // Try 2: Read from environment variables (Railway)
+    if (mbConfigs.length === 0 && process.env.MB_API_KEY) {
+      mbConfigs = [
+        { key: 'mb_api_key', value: process.env.MB_API_KEY || '' },
+        { key: 'mb_account_no', value: process.env.MB_ACCOUNT_NO || '' },
+        { key: 'mb_user', value: process.env.MB_USER || '' },
+        { key: 'mb_password', value: process.env.MB_PASSWORD || '' },
+        { key: 'mb_bot_token', value: process.env.MB_BOT_TOKEN || '' },
+        { key: 'mb_chat_id', value: process.env.MB_CHAT_ID || '' },
+        { key: 'mb_session_id', value: process.env.MB_SESSION_ID || '' },
+        { key: 'mb_token', value: process.env.MB_TOKEN || '' },
+        { key: 'mb_cookie', value: process.env.MB_COOKIE || '' },
+        { key: 'mb_device_id', value: process.env.MB_DEVICE_ID || '' },
+        { key: 'mb_id_run', value: process.env.MB_ID_RUN || '' },
+      ].filter(c => c.value);
+      if (mbConfigs.length > 0) console.log('[DB] Found MBBank config in environment variables');
+    }
+
+    // Insert into DB
+    for (const c of mbConfigs) {
+      await db.prepare("INSERT INTO sa_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value").run(c.key, c.value);
+    }
+    if (mbConfigs.length > 0) {
+      console.log(`[DB] ✅ Seeded ${mbConfigs.length} MBBank config keys`);
+    }
+  }
 }
 
 // Initialize with retry
