@@ -1790,7 +1790,10 @@ async function addFamilyMember(adminId, memberEmail) {
         let inviteBtn = await waitAndFind(driver, [
             'a[href*="invitemembers"]',
             'button[aria-label*="mời"]',
-            'a[aria-label*="mời"]'
+            'a[aria-label*="mời"]',
+            'a[href*="invite"]',
+            'button[aria-label*="Invite"]',
+            'a[aria-label*="Invite"]'
         ], 5000);
 
         if (inviteBtn) {
@@ -1800,28 +1803,127 @@ async function addFamilyMember(adminId, memberEmail) {
             // Fallback: navigate directly to invite URL
             console.log('[AddMember] Invite button not found, navigating directly...');
             await driver.get(INVITE_URL);
-            await smartSleep(driver, 3000);
+            await smartSleep(driver, 5000);
         }
+
+        // Check if we ended up on invite page or got redirected
+        currentUrl = await driver.getCurrentUrl();
+        console.log(`[AddMember] After invite nav URL: ${currentUrl}`);
+
+        // If redirected to login → login again
+        if (currentUrl.includes('accounts.google.com')) {
+            console.log('[AddMember] Redirected to login, re-authenticating...');
+            syncStatus[adminId].message = 'Đang đăng nhập lại...';
+            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            await driver.get(INVITE_URL);
+            await smartSleep(driver, 5000);
+            currentUrl = await driver.getCurrentUrl();
+            console.log(`[AddMember] After re-login URL: ${currentUrl}`);
+        }
+
+        // Log page content for debugging
+        const invitePageText = await driver.findElement(By.css('body')).getText();
+        console.log('[AddMember] Page text:', invitePageText.substring(0, 500));
 
         // Step 3: Find email input and type member email
         syncStatus[adminId].message = `Đang nhập email ${memberEmail}...`;
         console.log(`[AddMember] Finding email input...`);
 
-        const emailInput = await waitAndFind(driver, [
+        let emailInput = await waitAndFind(driver, [
             'input[type="email"]',
             'input[aria-label*="email"]',
+            'input[aria-label*="Email"]',
             'input[aria-label*="tên"]',
+            'input[aria-label*="name"]',
             'input[placeholder*="email"]',
-            'input[placeholder*="tên"]'
+            'input[placeholder*="Email"]',
+            'input[placeholder*="tên"]',
+            'input[placeholder*="name"]',
+            'input[type="text"]',
+            '[contenteditable="true"]'
         ], 10000);
 
+        // Method 2: XPath fallback — find input by label text
         if (!emailInput) {
-            // Take screenshot for debugging
-            const pageText = await driver.findElement(By.css('body')).getText();
-            console.log('[AddMember] Page text:', pageText.substring(0, 500));
-            throw new Error('Không tìm thấy ô nhập email trên trang mời — Google có thể đang load chậm, thử lại sau');
+            console.log('[AddMember] CSS selectors failed, trying XPath...');
+            try {
+                const xpaths = [
+                    "//input[contains(@aria-label, 'mail')]",
+                    "//input[contains(@aria-label, 'tên')]",
+                    "//input[contains(@aria-label, 'name')]",
+                    "//input[contains(@placeholder, 'mail')]",
+                    "//input[@type='email' or @type='text']"
+                ];
+                for (const xp of xpaths) {
+                    try {
+                        const el = await driver.findElement(By.xpath(xp));
+                        if (await el.isDisplayed()) { emailInput = el; break; }
+                    } catch { }
+                }
+            } catch { }
         }
 
+        // Method 3: JavaScript brute-force — find any visible text/email input
+        if (!emailInput) {
+            console.log('[AddMember] XPath failed, trying JS brute-force...');
+            try {
+                emailInput = await driver.executeScript(`
+                    const inputs = document.querySelectorAll('input');
+                    for (const inp of inputs) {
+                        const type = (inp.type || '').toLowerCase();
+                        if ((type === 'email' || type === 'text' || type === '') && inp.offsetParent !== null) {
+                            return inp;
+                        }
+                    }
+                    // Also check contenteditable
+                    const editables = document.querySelectorAll('[contenteditable="true"]');
+                    for (const e of editables) {
+                        if (e.offsetParent !== null) return e;
+                    }
+                    return null;
+                `);
+            } catch { }
+        }
+
+        // Method 4: Retry — reload invite page and try again
+        if (!emailInput) {
+            console.log('[AddMember] Input not found, reloading invite page...');
+            await driver.get(INVITE_URL);
+            await smartSleep(driver, 5000);
+
+            // Log page for debugging
+            const debugUrl = await driver.getCurrentUrl();
+            const debugText = await driver.findElement(By.css('body')).getText();
+            console.log('[AddMember] Retry URL:', debugUrl);
+            console.log('[AddMember] Retry page text:', debugText.substring(0, 800));
+
+            emailInput = await waitAndFind(driver, [
+                'input[type="email"]',
+                'input[type="text"]',
+                'input[aria-label*="email"]',
+                'input[placeholder*="email"]',
+                '[contenteditable="true"]'
+            ], 10000);
+
+            // Final JS attempt
+            if (!emailInput) {
+                emailInput = await driver.executeScript(`
+                    const inputs = document.querySelectorAll('input');
+                    for (const inp of inputs) {
+                        if (inp.offsetParent !== null && inp.type !== 'hidden') return inp;
+                    }
+                    return null;
+                `);
+            }
+        }
+
+        if (!emailInput) {
+            const pageText = await driver.findElement(By.css('body')).getText();
+            console.log('[AddMember] FAILED - Page text:', pageText.substring(0, 800));
+            throw new Error('Không tìm thấy ô nhập email trên trang mời — Google có thể đã thay đổi giao diện, thử lại sau');
+        }
+
+        console.log('[AddMember] ✓ Found email input');
         await safeFill(driver, emailInput, memberEmail);
         await smartSleep(driver, 2000);
 
