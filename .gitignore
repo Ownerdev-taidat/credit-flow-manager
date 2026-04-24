@@ -3,7 +3,12 @@ node_modules/
 
 # Database files
 *.db
+*.db-shm
+*.db-wal
 data/
+
+# Sensitive config
+config.json
 
 # Browser profiles (Chrome sessions — must stay local)
 browser_data/

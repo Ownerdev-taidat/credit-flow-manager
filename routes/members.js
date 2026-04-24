@@ -44,7 +44,7 @@ router.get('/:id', requireAuth, async (req, res) => {
 
 // POST /api/members
 router.post('/', requireAuth, async (req, res) => {
-  const { admin_id, name, email, avatar_color } = req.body;
+  const { admin_id, name, email, avatar_color, duration_days } = req.body;
   if (!admin_id || !name) return res.status(400).json({ error: 'admin_id and name are required' });
 
   const userId = req.session.userId;
@@ -54,7 +54,15 @@ router.post('/', requireAuth, async (req, res) => {
   const memberCount = await db.prepare("SELECT COUNT(*) as count FROM members WHERE admin_id = ? AND status = 'active'").get(admin_id);
   if (parseInt(memberCount.count) >= admin.max_members) return res.status(400).json({ error: `Admin đã đạt tối đa ${admin.max_members} thành viên` });
 
-  const result = await db.prepare('INSERT INTO members (admin_id, name, email, avatar_color) VALUES (?, ?, ?, ?)').run(admin_id, name, email || '', avatar_color || '#6366f1');
+  // Auto-set start_date (today) and end_date (today + duration_days, default 30)
+  const today = new Date();
+  const start_date = today.toISOString().split('T')[0]; // YYYY-MM-DD
+  const days = parseInt(duration_days) || 30;
+  const endDate = new Date(today);
+  endDate.setDate(endDate.getDate() + days);
+  const end_date = endDate.toISOString().split('T')[0];
+
+  const result = await db.prepare('INSERT INTO members (admin_id, name, email, avatar_color, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?)').run(admin_id, name, email || '', avatar_color || '#6366f1', start_date, end_date);
   await db.prepare('INSERT INTO storage_logs (member_id, admin_id, drive_gb, gmail_gb, photos_gb) VALUES (?, ?, 0, 0, 0)').run(result.lastInsertRowid, admin_id);
 
   const member = await db.prepare('SELECT * FROM members WHERE id = ?').get(result.lastInsertRowid);
