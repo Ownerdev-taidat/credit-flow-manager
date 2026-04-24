@@ -255,51 +255,62 @@ function classifyScraperError(rawMessage) {
 }
 
 // ========= BROWSER CONCURRENCY CONTROL =========
-// TOTAL max 9 browsers at any time (3 visible + 6 headless).
+// TOTAL max browsers at any time. 1 slot RESERVED for user actions (add/remove member).
 const MAX_TOTAL_BROWSERS = 4;
+const MAX_SYNC_BROWSERS = 3; // Auto-sync can use at most 3, leaving 1 for user actions
 const MAX_VISIBLE_BROWSERS = 2;
 let activeBrowsers = 0;
 let activeVisible = 0;
+let activeSyncBrowsers = 0; // Track sync-only browsers
 const browserQueue = [];
 
-function acquireBrowserSlot(isHeadless) {
-    const SLOT_TIMEOUT = 5 * 60 * 1000; // 5 minutes max wait for a slot
+function acquireBrowserSlot(isHeadless, isUserAction = false) {
+    const SLOT_TIMEOUT = isUserAction ? 2 * 60 * 1000 : 5 * 60 * 1000; // User actions timeout faster (2 min)
     return new Promise((resolve, reject) => {
         const timeoutId = setTimeout(() => {
-            // Remove from queue if still waiting
             const idx = browserQueue.findIndex(q => q.tryAcquire === tryAcquire);
             if (idx !== -1) browserQueue.splice(idx, 1);
-            console.error(`[Browser] ⏰ Slot timeout after ${SLOT_TIMEOUT / 1000}s! Resetting counters...`);
-            // Emergency reset — slots are likely leaked
+            console.error(`[Browser] ⏰ Slot timeout after ${SLOT_TIMEOUT / 1000}s!`);
             activeBrowsers = Math.max(0, activeBrowsers - 1);
-            reject(new Error('⏰ Hết thời gian chờ slot browser (5 phút) — có thể do Chrome zombie. Thử lại sau.'));
+            reject(new Error('⏰ Hết thời gian chờ slot browser — thử lại sau.'));
         }, SLOT_TIMEOUT);
 
         const tryAcquire = () => {
-            const hasTotal = activeBrowsers < MAX_TOTAL_BROWSERS;
+            // User actions: can use ANY slot (up to MAX_TOTAL_BROWSERS)
+            // Sync actions: limited to MAX_SYNC_BROWSERS (reserves 1 slot for user)
+            const maxForThis = isUserAction ? MAX_TOTAL_BROWSERS : MAX_SYNC_BROWSERS;
+            const currentForThis = isUserAction ? activeBrowsers : activeSyncBrowsers;
+            const hasTotal = activeBrowsers < MAX_TOTAL_BROWSERS && currentForThis < maxForThis;
             const hasVisible = isHeadless || activeVisible < MAX_VISIBLE_BROWSERS;
 
             if (hasTotal && hasVisible) {
                 clearTimeout(timeoutId);
                 activeBrowsers++;
+                if (!isUserAction) activeSyncBrowsers++;
                 if (!isHeadless) activeVisible++;
-                console.log(`[Browser] Slot acquired (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
+                console.log(`[Browser] Slot acquired ${isUserAction ? '(USER)' : '(sync)'} (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, sync: ${activeSyncBrowsers}/${MAX_SYNC_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
                 resolve();
             } else {
-                console.log(`[Browser] Queue waiting... (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
-                browserQueue.push({ tryAcquire });
+                console.log(`[Browser] Queue waiting ${isUserAction ? '(USER priority)' : '(sync)'}... (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, sync: ${activeSyncBrowsers}/${MAX_SYNC_BROWSERS})`);
+                // User actions go to FRONT of queue for priority
+                if (isUserAction) {
+                    browserQueue.unshift({ tryAcquire });
+                } else {
+                    browserQueue.push({ tryAcquire });
+                }
             }
         };
         tryAcquire();
     });
 }
 
-function releaseBrowserSlot(isHeadless) {
+function releaseBrowserSlot(isHeadless, isUserAction = false) {
     activeBrowsers = Math.max(0, activeBrowsers - 1);
+    if (!isUserAction) activeSyncBrowsers = Math.max(0, activeSyncBrowsers - 1);
     if (!isHeadless) activeVisible = Math.max(0, activeVisible - 1);
-    console.log(`[Browser] Slot released (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
+    console.log(`[Browser] Slot released ${isUserAction ? '(USER)' : '(sync)'} (total: ${activeBrowsers}/${MAX_TOTAL_BROWSERS}, sync: ${activeSyncBrowsers}/${MAX_SYNC_BROWSERS}, visible: ${activeVisible}/${MAX_VISIBLE_BROWSERS})`);
 
-    // Process queued requests (FIFO = top-to-bottom order)
+    // Process queued requests (FIFO — user actions already at front)
     if (browserQueue.length > 0) {
         const next = browserQueue.shift();
         next.tryAcquire();
@@ -315,7 +326,7 @@ const SYNC_TIMEOUT = 5 * 60 * 1000; // 5 minutes max per admin sync
  * - Profile mới/chưa login → hiện browser để login
  * - TOTAL max 7 browsers, visible max 3
  */
-async function createBrowser(adminId, email, forceVisible = false) {
+async function createBrowser(adminId, email, forceVisible = false, isUserAction = false) {
     // Use email for profile dir to avoid ID collisions between databases
     const safeEmail = (email || `admin_${adminId}`).replace(/[^a-zA-Z0-9]/g, '_');
     const profileDir = path.join(BROWSER_DATA_DIR, `profile_${safeEmail}`);
@@ -333,8 +344,8 @@ async function createBrowser(adminId, email, forceVisible = false) {
         console.log(`[Scraper] Farm ${adminId}: visible mode (lastSyncOk=${lastSyncOk}, force=${forceVisible})`);
     }
 
-    // Wait for browser slot
-    await acquireBrowserSlot(useHeadless);
+    // Wait for browser slot — user actions get priority
+    await acquireBrowserSlot(useHeadless, isUserAction);
 
     // Clean up stale lock files from crashed Chrome sessions
     const lockFiles = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
@@ -418,18 +429,19 @@ async function createBrowser(adminId, email, forceVisible = false) {
             } catch (retryErr) {
                 console.error(`[Scraper] ❌ Retry also failed for admin ${adminId}: ${(retryErr.message || '').substring(0, 200)}`);
                 // CRITICAL: release slot if browser build fails completely
-                releaseBrowserSlot(useHeadless);
+                releaseBrowserSlot(useHeadless, isUserAction);
                 throw retryErr;
             }
         } else {
             // CRITICAL: release slot if browser build fails
-            releaseBrowserSlot(useHeadless);
+            releaseBrowserSlot(useHeadless, isUserAction);
             throw buildErr;
         }
     }
 
     // Tag driver with headless info for slot release
     driver._isHeadless = useHeadless;
+    driver._isUserAction = isUserAction;
 
     // Set page load timeout (30s for headless, 60s for visible)
     try {
@@ -1751,7 +1763,7 @@ async function addFamilyMember(adminId, memberEmail) {
     let watchdog = null;
 
     try {
-        driver = await createBrowser(adminId, admin.email);
+        driver = await createBrowser(adminId, admin.email, false, true); // isUserAction=true
         slotAcquired = true;
         isHeadless = driver._isHeadless;
 
@@ -2116,7 +2128,7 @@ async function addFamilyMember(adminId, memberEmail) {
                 try { await driver.quit(); } catch { }
             }
         }
-        if (slotAcquired) releaseBrowserSlot(isHeadless);
+        if (slotAcquired) releaseBrowserSlot(isHeadless, true);
     }
 }
 
@@ -2138,7 +2150,7 @@ async function cancelInvitation(adminId, memberEmail) {
     let watchdog = null;
 
     try {
-        driver = await createBrowser(adminId, admin.email);
+        driver = await createBrowser(adminId, admin.email, false, true); // isUserAction=true
         slotAcquired = true;
         isHeadless = driver._isHeadless;
 
@@ -2296,7 +2308,7 @@ async function cancelInvitation(adminId, memberEmail) {
                 try { await driver.quit(); } catch { }
             }
         }
-        if (slotAcquired) releaseBrowserSlot(isHeadless);
+        if (slotAcquired) releaseBrowserSlot(isHeadless, true);
     }
 }
 
@@ -2321,7 +2333,7 @@ async function removeFamilyMember(adminId, memberId) {
     let watchdog = null;
 
     try {
-        driver = await createBrowser(adminId, admin.email);
+        driver = await createBrowser(adminId, admin.email, false, true); // isUserAction=true
         slotAcquired = true;
         isHeadless = driver._isHeadless;
 
@@ -2660,7 +2672,7 @@ async function removeFamilyMember(adminId, memberId) {
                 try { await driver.quit(); } catch { }
             }
         }
-        if (slotAcquired) releaseBrowserSlot(isHeadless);
+        if (slotAcquired) releaseBrowserSlot(isHeadless, true);
     }
 }
 
