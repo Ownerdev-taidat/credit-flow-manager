@@ -318,7 +318,7 @@ function releaseBrowserSlot(isHeadless, isUserAction = false) {
 }
 
 // ========= SYNC TIMEOUT =========
-const SYNC_TIMEOUT = 5 * 60 * 1000; // 5 minutes max per admin sync
+const SYNC_TIMEOUT = 8 * 60 * 1000; // 8 minutes max per admin sync (increased from 5 to handle slow Google pages)
 
 /**
  * Create Chrome browser — smart headless with concurrency control:
@@ -443,11 +443,11 @@ async function createBrowser(adminId, email, forceVisible = false, isUserAction 
     driver._isHeadless = useHeadless;
     driver._isUserAction = isUserAction;
 
-    // Set page load timeout (30s for headless, 60s for visible)
+    // Set page load timeout (60s for headless, 90s for visible) — increased to handle slow Google One pages
     try {
         await driver.manage().setTimeouts({
-            pageLoad: useHeadless ? 30000 : 60000,
-            script: useHeadless ? 10000 : 30000
+            pageLoad: useHeadless ? 60000 : 90000,
+            script: useHeadless ? 30000 : 60000
         });
     } catch { }
 
@@ -949,34 +949,58 @@ async function syncAdmin(adminId) {
             console.log(`[Scraper] Admin ${adminId}: plan expired, still scraping remaining data...`);
         }
 
-        // Scrape credits
+        // Scrape credits — with retry
         syncStatus[adminId].message = 'Đang lấy dữ liệu credit...';
         let creditData;
-        try {
-            creditData = await scrapeCredits(driver);
-        } catch (e) {
-            console.error('[Scraper] Credit scrape error:', e.message);
-            creditData = { monthlyCredits: 0, bonusCredits: 0, memberUsage: [] };
+        for (let _attempt = 1; _attempt <= 2; _attempt++) {
+            try {
+                creditData = await scrapeCredits(driver);
+                break;
+            } catch (e) {
+                console.error(`[Scraper] Credit scrape error (attempt ${_attempt}/2):`, e.message);
+                if (_attempt < 2) {
+                    console.log('[Scraper] Retrying credit scrape in 5s...');
+                    await driver.sleep(5000);
+                } else {
+                    creditData = { monthlyCredits: 0, bonusCredits: 0, memberUsage: [] };
+                }
+            }
         }
 
-        // Scrape family members
+        // Scrape family members — with retry
         syncStatus[adminId].message = 'Đang lấy danh sách thành viên gia đình...';
         let familyMembers;
-        try {
-            familyMembers = await scrapeFamily(driver, adminId, admin.email);
-        } catch (e) {
-            console.error('[Scraper] Family scrape error:', e.message);
-            familyMembers = [];
+        for (let _attempt = 1; _attempt <= 2; _attempt++) {
+            try {
+                familyMembers = await scrapeFamily(driver, adminId, admin.email);
+                break;
+            } catch (e) {
+                console.error(`[Scraper] Family scrape error (attempt ${_attempt}/2):`, e.message);
+                if (_attempt < 2) {
+                    console.log('[Scraper] Retrying family scrape in 5s...');
+                    await driver.sleep(5000);
+                } else {
+                    familyMembers = [];
+                }
+            }
         }
 
-        // Scrape storage
+        // Scrape storage — with retry
         syncStatus[adminId].message = 'Đang lấy dữ liệu bộ nhớ...';
         let storageData;
-        try {
-            storageData = await scrapeStorage(driver);
-        } catch (e) {
-            console.error('[Scraper] Storage scrape error:', e.message);
-            storageData = { totalStorage: '30 TB', totalUsed: '0 GB', driveGB: 0, gmailGB: 0, photosGB: 0, familyStorage: [] };
+        for (let _attempt = 1; _attempt <= 2; _attempt++) {
+            try {
+                storageData = await scrapeStorage(driver);
+                break;
+            } catch (e) {
+                console.error(`[Scraper] Storage scrape error (attempt ${_attempt}/2):`, e.message);
+                if (_attempt < 2) {
+                    console.log('[Scraper] Retrying storage scrape in 5s...');
+                    await driver.sleep(5000);
+                } else {
+                    storageData = { totalStorage: '30 TB', totalUsed: '0 GB', driveGB: 0, gmailGB: 0, photosGB: 0, familyStorage: [] };
+                }
+            }
         }
 
         // Save to DB
@@ -1028,7 +1052,7 @@ async function checkPlanStatus(driver, adminId) {
     try {
         // Go to Google One HOME page (more reliable than plans page)
         await driver.get(GOOGLE_ONE_HOME);
-        await driver.sleep(8000);
+        await driver.sleep(12000); // 12s — Google One home page needs time to render plan info
 
         const bodyText = await driver.executeScript('return document.body.innerText') || '';
         const pageUrl = await driver.getCurrentUrl();
@@ -1072,7 +1096,7 @@ async function checkPlanStatus(driver, adminId) {
 async function scrapeCredits(driver) {
     console.log('[Scraper] Navigating to credits page...');
     await driver.get(CREDIT_URL);
-    await driver.sleep(8000); // FULL wait — page must render credit numbers
+    await driver.sleep(15000); // 15s FULL wait — Google One credit page is heavy, needs more time
 
     let monthlyCredits = 0, bonusCredits = 0, memberUsage = [];
 
@@ -1326,7 +1350,7 @@ async function scrapeFamily(driver, adminId, adminEmail) {
 async function scrapeStorage(driver) {
     console.log('[Scraper] Navigating to storage page...');
     await driver.get(STORAGE_URL);
-    await driver.sleep(8000); // FULL wait — storage page must render
+    await driver.sleep(15000); // 15s FULL wait — storage page is heavy, needs more time to render
 
     let totalStorage = '30 TB', totalUsed = '0 GB';
     let driveGB = 0, gmailGB = 0, photosGB = 0;
@@ -1559,8 +1583,8 @@ async function processPool(admins, label) {
         running.add(p);
         p.finally(() => running.delete(p));
 
-        // Small delay between launches to avoid thundering herd
-        await new Promise(r => setTimeout(r, 2000));
+        // Delay between launches — 5s to avoid Google rate-limiting and Chrome resource contention
+        await new Promise(r => setTimeout(r, 5000));
     }
 
     // Wait for remaining farms to finish
@@ -1786,7 +1810,33 @@ async function addFamilyMember(adminId, memberEmail) {
         if (currentUrl.includes('accounts.google.com') || currentUrl.includes('/about')) {
             console.log('[AddMember] Not logged in, performing login...');
             syncStatus[adminId].message = 'Đang đăng nhập...';
-            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            try {
+                await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            } catch (loginErr) {
+                if (loginErr.message === 'NEEDS_VISIBLE_LOGIN') {
+                    console.log('[AddMember] Session expired, retrying with visible browser...');
+                    try { await driver.quit(); } catch { }
+                    releaseBrowserSlot(isHeadless, true);
+                    slotAcquired = false;
+                    driver = null;
+
+                    driver = await createBrowser(adminId, admin.email, true, true);
+                    slotAcquired = true;
+                    isHeadless = false;
+
+                    // Reset watchdog
+                    if (watchdog) clearTimeout(watchdog);
+                    watchdog = setTimeout(async () => {
+                        console.log(`[AddMember] ⏰ Watchdog: admin ${adminId} exceeded 3 min, killing browser`);
+                        syncStatus[adminId] = { status: 'error', message: '⏰ Thêm thành viên quá 3 phút — tự động dừng. Thử lại sau.' };
+                        if (driver) { try { await forceKillDriver(driver); } catch (e) { try { await driver.quit(); } catch { } } driver = null; }
+                    }, 3 * 60 * 1000);
+
+                    await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+                } else {
+                    throw loginErr;
+                }
+            }
             // After login, go straight to family page
             await driver.get(FAMILY_URL);
             await smartSleep(driver, 5000);
@@ -2173,7 +2223,31 @@ async function cancelInvitation(adminId, memberEmail) {
         if (currentUrl.includes('accounts.google.com') || currentUrl.includes('/about')) {
             console.log('[CancelInvite] Not logged in, performing login...');
             syncStatus[adminId].message = 'Đang đăng nhập...';
-            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            try {
+                await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            } catch (loginErr) {
+                if (loginErr.message === 'NEEDS_VISIBLE_LOGIN') {
+                    console.log('[CancelInvite] Session expired, retrying with visible browser...');
+                    try { await driver.quit(); } catch { }
+                    releaseBrowserSlot(isHeadless, true);
+                    slotAcquired = false;
+                    driver = null;
+
+                    driver = await createBrowser(adminId, admin.email, true, true);
+                    slotAcquired = true;
+                    isHeadless = false;
+
+                    if (watchdog) clearTimeout(watchdog);
+                    watchdog = setTimeout(async () => {
+                        syncStatus[adminId] = { status: 'error', message: '⏰ Hủy lời mời quá 3 phút — tự động dừng.' };
+                        if (driver) { try { await forceKillDriver(driver); } catch (e) { try { await driver.quit(); } catch { } } driver = null; }
+                    }, 3 * 60 * 1000);
+
+                    await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+                } else {
+                    throw loginErr;
+                }
+            }
             await driver.get(FAMILY_URL);
             await smartSleep(driver, 3000);
         } else {
@@ -2356,7 +2430,31 @@ async function removeFamilyMember(adminId, memberId) {
         if (currentUrl.includes('accounts.google.com') || currentUrl.includes('/about')) {
             console.log('[RemoveMember] Not logged in, performing login...');
             syncStatus[adminId].message = 'Đang đăng nhập...';
-            await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            try {
+                await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+            } catch (loginErr) {
+                if (loginErr.message === 'NEEDS_VISIBLE_LOGIN') {
+                    console.log('[RemoveMember] Session expired, retrying with visible browser...');
+                    try { await driver.quit(); } catch { }
+                    releaseBrowserSlot(isHeadless, true);
+                    slotAcquired = false;
+                    driver = null;
+
+                    driver = await createBrowser(adminId, admin.email, true, true);
+                    slotAcquired = true;
+                    isHeadless = false;
+
+                    if (watchdog) clearTimeout(watchdog);
+                    watchdog = setTimeout(async () => {
+                        syncStatus[adminId] = { status: 'error', message: '⏰ Xóa thành viên quá 3 phút — tự động dừng.' };
+                        if (driver) { try { await forceKillDriver(driver); } catch (e) { try { await driver.quit(); } catch { } } driver = null; }
+                    }, 3 * 60 * 1000);
+
+                    await googleLogin(driver, admin.email, googlePassword, admin.totp_secret, adminId);
+                } else {
+                    throw loginErr;
+                }
+            }
             await driver.get(FAMILY_URL);
             await smartSleep(driver, 3000);
         } else {
