@@ -56,7 +56,7 @@ if (chromeFound) {
 
 if (useVpsBridge) {
   const SYNC_KEY = process.env.SYNC_API_KEY || 'sync-bridge-2026';
-  const VPS_URL = process.env.VPS_SYNC_URL || 'http://147.124.205.237:3000';
+  const VPS_URL = process.env.VPS_SYNC_URL || 'http://160.25.88.101:3000';
   console.log(`[Admins] VPS Bridge → ${VPS_URL}`);
 
   syncAdmin = async (adminId) => {
