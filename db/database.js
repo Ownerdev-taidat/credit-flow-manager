@@ -25,13 +25,19 @@ if (USE_PG) {
     console.error('[DB] Pool error:', err.message);
   });
 } else {
-  const Database = require('better-sqlite3');
-  const dbPath = path.join(__dirname, '..', 'data', 'creditflow.db');
-  const fs = require('fs');
-  if (!fs.existsSync(path.dirname(dbPath))) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-  sqlite = new Database(dbPath);
-  sqlite.pragma('journal_mode = WAL');
-  sqlite.pragma('foreign_keys = ON');
+  try {
+    const Database = require('better-sqlite3');
+    const dbPath = path.join(__dirname, '..', 'data', 'creditflow.db');
+    const fs = require('fs');
+    if (!fs.existsSync(path.dirname(dbPath))) fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+    sqlite = new Database(dbPath);
+    sqlite.pragma('journal_mode = WAL');
+    sqlite.pragma('foreign_keys = ON');
+  } catch (err) {
+    console.error('[DB] better-sqlite3 not available:', err.message);
+    console.error('[DB] Set DATABASE_URL to use PostgreSQL in production');
+    process.exit(1);
+  }
 }
 
 // Helper: convert ? placeholders to $1, $2, $3... (for PG only)
